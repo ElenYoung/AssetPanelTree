@@ -1,10 +1,65 @@
 # Panel Tree (P-Tree)
 
-A supervised clustering algorithm designed for **panel data**, commonly used in quantitative finance to identify time-varying, cross-sectional predictability regimes.
+[![PyPI version](https://badge.fury.io/py/ptree-panel.svg)](https://pypi.org/project/ptree-panel/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A **supervised clustering algorithm** designed for **panel data**, commonly used in quantitative finance to identify time-varying, cross-sectional predictability regimes.
+
+## Installation
+
+```bash
+pip install ptree-panel
+
+# With visualization support (matplotlib, seaborn)
+pip install ptree-panel[viz]
+
+# For development
+pip install ptree-panel[dev]
+```
 
 ## Core Idea
 
 P-Tree recursively splits the full sample into disjoint leaf nodes using asset characteristics or macro states as thresholds. Unlike standard decision trees that minimise residual MSE, P-Tree **maximises the difference in predictive performance across child nodes**, producing a *prediction mosaic* — a map showing where and when alpha is concentrated.
+
+### Key Differentiators
+
+| Feature | Standard Decision Tree | P-Tree |
+|---------|----------------------|--------|
+| **Objective** | Minimise residual MSE/Gini | Maximise predictability difference |
+| **Leaf Model** | Constant (mean) | Ridge regression / Logit |
+| **Use Case** | Point prediction | Regime identification |
+| **Output** | Single prediction | Prediction mosaic |
+
+### Algorithm Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Full Sample                              │
+│                     (all time × assets)                          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+         ┌─────────────────┴─────────────────┐
+         │     For each (feature, threshold): │
+         │     1. Split into Left & Right     │
+         │     2. Fit Ridge on each subset    │
+         │     3. Compute R² for each         │
+         │     4. Score = |R²_L - R²_R|       │
+         └─────────────────┬─────────────────┘
+                           │
+              Select split with max score
+                           │
+         ┌─────────────────┴─────────────────┐
+         ▼                                   ▼
+   ┌──────────┐                       ┌──────────┐
+   │ Left Node│                       │Right Node│
+   │ (low val)│                       │(high val)│
+   └────┬─────┘                       └────┬─────┘
+        │                                  │
+        ▼                                  ▼
+   Recurse or                         Recurse or
+   become Leaf                        become Leaf
+```
 
 ## Project Structure
 
@@ -65,13 +120,20 @@ for leaf_id, indices in engine.get_leaf_samples().items():
 ## Module Overview
 
 ### DataHandler
+
+Handles panel data preprocessing including alignment, missing value imputation, cross-sectional rank standardisation, and volatility computation.
+
 | Parameter | Default | Description |
 |---|---|---|
 | `cs_rank_standardize` | `True` | Cross-sectional rank normalisation to [0, 1] |
 | `vol_window` | `60` | Rolling window for volatility computation |
+| `min_obs` | `20` | Minimum observations for volatility calculation |
 | `fillna_method` | `"ffill"` | Missing-value strategy (`ffill`, `bfill`, `zero`, `mean`, `None`) |
 
 ### Predictors
+
+All predictors inherit from `PredictorBase` and implement `fit()` / `predict()`.
+
 | Class | Use Case |
 |---|---|
 | `RidgeRegressor` | Standard Ridge regression (closed-form) |
@@ -79,33 +141,57 @@ for leaf_id, indices in engine.get_leaf_samples().items():
 | `RidgeLogitClassifier` | Ridge logistic regression via IRLS |
 | `SelfDefinedPredictor` | User-defined model base class |
 
+**Custom Predictor Example:**
+
+```python
+from ptree import SelfDefinedPredictor
+
+class MyLGBPredictor(SelfDefinedPredictor):
+    def fit(self, X, y, weights=None):
+        import lightgbm as lgb
+        self.model = lgb.LGBMRegressor().fit(X, y, sample_weight=weights)
+        return self
+    
+    def predict(self, X):
+        return self.model.predict(X)
+```
+
 ### Criteria
+
+Split-quality criteria evaluate whether a candidate split produces child nodes with meaningfully different predictability.
+
 | Class | Description |
 |---|---|
 | `R2DiffCriterion` | Maximise \|R²_L − R²_R\| (regression) |
 | `ClassificationCriterion` | Maximise difference in Precision / F1 / AUC (classification) |
 
 ### PanelTreeEngine
+
+The main engine for building and querying Panel Trees.
+
 | Parameter | Default | Description |
 |---|---|---|
+| `predictor` | `RidgeRegressor` | Leaf-node predictor (instance or class) |
+| `criterion` | `R2DiffCriterion()` | Split-quality criterion |
 | `split_thresholds` | `[0.3, 0.5, 0.7]` | Candidate split points on (rank-standardised) feature values |
 | `max_depth` | `3` | Maximum tree depth |
 | `min_samples` | `100` | Minimum observations per node |
 | `fast_mode` | `False` | Enable feature-priority caching from parent nodes |
 | `early_stopping_threshold` | `None` | Stop searching if criterion exceeds this value (requires `fast_mode`) |
 | `n_jobs` | `1` | Parallel workers (`-1` = all cores) |
+| `verbose` | `1` | Logging verbosity (0=silent, 1=per-level, 2=per-candidate) |
 
 ## Output & Query API Reference
 
-P-Tree 提供了丰富的输出与查询接口，分布在 `PanelTreeEngine`、`PanelTreeNode`、`NodeReporter` 和 `MosaicVisualizer` 四个类中。
+P-Tree provides rich output and query interfaces across four main classes: `PanelTreeEngine`, `PanelTreeNode`, `NodeReporter`, and `MosaicVisualizer`.
 
 ---
 
-### PanelTreeEngine 输出方法
+### PanelTreeEngine Methods
 
 #### `engine.predict(X) → np.ndarray`
 
-对新数据生成逐样本预测。每条观测值沿树结构下行至对应叶子节点，由该叶子的局部模型给出预测值。
+Generate per-sample predictions on new data. Each observation traverses down the tree to its corresponding leaf node, which provides the prediction using its local model.
 
 ```python
 preds = engine.predict(X_proc)  # shape: (n_samples,)
@@ -113,7 +199,7 @@ preds = engine.predict(X_proc)  # shape: (n_samples,)
 
 #### `engine.get_leaves() → List[PanelTreeNode]`
 
-返回所有叶子节点对象的列表。
+Return a list of all leaf node objects.
 
 ```python
 for leaf in engine.get_leaves():
@@ -122,33 +208,33 @@ for leaf in engine.get_leaves():
 
 #### `engine.get_all_nodes() → List[PanelTreeNode]`
 
-返回整棵树的所有节点（BFS 顺序），包括内部节点和叶子节点。
+Return all nodes in the tree (BFS order), including both internal nodes and leaves.
 
 ```python
 all_nodes = engine.get_all_nodes()
-print(f"总节点数: {len(all_nodes)}")
+print(f"Total nodes: {len(all_nodes)}")
 ```
 
 #### `engine.get_node_report() → pd.DataFrame`
 
-返回一个结构化 DataFrame，每行对应一个节点，包含以下列：
+Return a structured DataFrame with one row per node containing the following columns:
 
-| 列名 | 说明 |
+| Column | Description |
 |---|---|
-| `Node_ID` | 唯一节点标识 |
-| `Depth` | 节点深度（root = 0） |
-| `Rule` | 从根到该节点的完整路径规则，如 `root & char_1 >= 0.5 & char_3 < 0.7` |
-| `Is_Leaf` | 是否为叶子节点 |
-| `N_Samples` | 节点包含的样本数 |
-| `Sample_Ratio` | 样本数占总样本的比例 |
-| `Split_Feature` | 分裂所用特征名（叶子为 NaN） |
-| `Split_Threshold` | 分裂阈值（叶子为 NaN） |
-| `Split_Score` | 分裂时准则得分 |
-| `Predictability_Score` | 该节点的可预测性强度（回归为 R²，分类为 Precision） |
-| `Metrics` | 完整指标字典（如 `{"r2": 0.63, "mse": 0.22, "n_samples": 2429}`） |
-| `Model_Weights` | 叶子节点模型的特征系数列表 |
-| `Elapsed_Time_s` | 该节点构建耗时（秒） |
-| `Parent_ID` | 父节点 ID |
+| `Node_ID` | Unique node identifier |
+| `Depth` | Node depth (root = 0) |
+| `Rule` | Full path rule from root, e.g., `root & char_1 >= 0.5 & char_3 < 0.7` |
+| `Is_Leaf` | Whether the node is a leaf |
+| `N_Samples` | Number of samples in the node |
+| `Sample_Ratio` | Ratio of samples relative to total |
+| `Split_Feature` | Feature used for splitting (NaN for leaves) |
+| `Split_Threshold` | Split threshold value (NaN for leaves) |
+| `Split_Score` | Criterion score at split |
+| `Predictability_Score` | Predictability strength (R² for regression, Precision for classification) |
+| `Metrics` | Full metrics dictionary, e.g., `{"r2": 0.63, "mse": 0.22, "n_samples": 2429}` |
+| `Model_Weights` | Feature coefficients of the leaf model |
+| `Elapsed_Time_s` | Time spent building the node (seconds) |
+| `Parent_ID` | Parent node ID |
 
 ```python
 report = engine.get_node_report()
@@ -157,30 +243,30 @@ print(report[["Node_ID", "Depth", "Rule", "Predictability_Score", "N_Samples"]])
 
 #### `engine.get_leaf_samples() → Dict[int, np.ndarray]`
 
-返回一个字典，key 为叶子节点 `node_id`，value 为该叶子覆盖的原始样本行索引数组。用于提取各个 cluster 对应的原始数据。
+Return a dictionary mapping leaf `node_id` to an array of original sample row indices. Useful for extracting the raw data corresponding to each cluster.
 
 ```python
 leaf_samples = engine.get_leaf_samples()
 for leaf_id, indices in leaf_samples.items():
     subset = original_df.iloc[indices]
-    print(f"Leaf {leaf_id}: {len(indices)} 样本, "
-          f"平均收益={subset['ret'].mean():.4f}, "
-          f"覆盖资产数={subset['asset_id'].nunique()}")
+    print(f"Leaf {leaf_id}: {len(indices)} samples, "
+          f"mean_return={subset['ret'].mean():.4f}, "
+          f"unique_assets={subset['asset_id'].nunique()}")
 ```
 
 ---
 
-### PanelTreeNode 输出方法
+### PanelTreeNode Methods
 
-每个节点对象可通过 `engine.get_leaves()` 或 `engine.get_all_nodes()` 获取。
+Node objects can be obtained via `engine.get_leaves()` or `engine.get_all_nodes()`.
 
 #### `node.n_samples → int`
 
-该节点包含的样本数量（只读属性）。
+Number of samples contained in this node (read-only property).
 
 #### `node.metrics → Dict[str, float]`
 
-节点的评估指标字典。回归任务包含 `r2`, `mse`, `n_samples`；分类任务包含 `precision`, `f1`, `auc`, `n_samples`。
+Evaluation metrics dictionary. For regression: `r2`, `mse`, `n_samples`. For classification: `precision`, `f1`, `auc`, `n_samples`.
 
 ```python
 leaf = engine.get_leaves()[0]
@@ -189,7 +275,7 @@ print(leaf.metrics)  # {"r2": 0.63, "mse": 0.22, "n_samples": 2429}
 
 #### `node.get_model_weights() → np.ndarray | None`
 
-返回叶子节点局部模型的特征系数向量。可直接查看在特定环境下哪些因子在起作用。
+Return the feature coefficient vector of the leaf node's local model. Useful for inspecting which factors are active in a specific regime.
 
 ```python
 for leaf in engine.get_leaves():
@@ -201,17 +287,17 @@ for leaf in engine.get_leaves():
 
 #### `node.get_samples() → np.ndarray | None`
 
-返回该节点覆盖的样本行索引。功能与 `engine.get_leaf_samples()` 类似，但可用于任意节点（包括内部节点）。
+Return sample row indices belonging to this node. Similar to `engine.get_leaf_samples()`, but can be used for any node (including internal nodes).
 
 ```python
-node = engine.get_all_nodes()[1]  # 第二个节点
+node = engine.get_all_nodes()[1]  # Second node
 indices = node.get_samples()
-print(f"Node {node.node_id} 包含 {len(indices)} 个样本")
+print(f"Node {node.node_id} contains {len(indices)} samples")
 ```
 
 #### `node.to_dict() → Dict[str, Any]`
 
-将节点的所有元数据序列化为平坦字典，方便构建 DataFrame 或导出 JSON。
+Serialise all node metadata to a flat dictionary, convenient for building DataFrames or exporting to JSON.
 
 ```python
 import json
@@ -219,26 +305,26 @@ leaf = engine.get_leaves()[0]
 print(json.dumps(leaf.to_dict(), indent=2, default=str))
 ```
 
-#### 常用只读属性
+#### Common Read-Only Attributes
 
-| 属性 | 类型 | 说明 |
+| Attribute | Type | Description |
 |---|---|---|
-| `node.node_id` | `int` | 唯一标识 |
-| `node.depth` | `int` | 深度层级 |
-| `node.rule` | `str` | 路径描述，如 `root & char_1 < 0.5 & char_3 >= 0.7` |
-| `node.split_feature` | `str \| None` | 分裂特征名 |
-| `node.split_threshold` | `float \| None` | 分裂阈值 |
-| `node.split_score` | `float \| None` | 分裂时准则得分 |
-| `node.is_leaf` | `bool` | 是否为叶子 |
-| `node.sample_ratio` | `float` | 样本覆盖比例 |
-| `node.elapsed_time` | `float` | 构建耗时（秒） |
-| `node.predictor` | `PredictorBase` | 已训练的局部模型实例 |
+| `node.node_id` | `int` | Unique identifier |
+| `node.depth` | `int` | Depth level |
+| `node.rule` | `str` | Path description, e.g., `root & char_1 < 0.5 & char_3 >= 0.7` |
+| `node.split_feature` | `str \| None` | Split feature name |
+| `node.split_threshold` | `float \| None` | Split threshold |
+| `node.split_score` | `float \| None` | Criterion score at split |
+| `node.is_leaf` | `bool` | Whether this is a leaf |
+| `node.sample_ratio` | `float` | Sample coverage ratio |
+| `node.elapsed_time` | `float` | Build time (seconds) |
+| `node.predictor` | `PredictorBase` | Trained local model instance |
 
 ---
 
-### NodeReporter 输出方法
+### NodeReporter Methods
 
-`NodeReporter` 封装了面向用户的报告功能，需传入已拟合的 `PanelTreeEngine`。
+`NodeReporter` encapsulates user-facing reporting functionality. It requires a fitted `PanelTreeEngine`.
 
 ```python
 from ptree import NodeReporter
@@ -247,7 +333,7 @@ reporter = NodeReporter(engine)
 
 #### `reporter.summary() → pd.DataFrame`
 
-返回完整节点报告 DataFrame（所有节点，包括内部节点和叶子），列定义同 `engine.get_node_report()`。
+Return a complete node report DataFrame (all nodes, including internal nodes and leaves). Column definitions are the same as `engine.get_node_report()`.
 
 ```python
 full = reporter.summary()
@@ -256,14 +342,14 @@ print(full[["Node_ID", "Depth", "Is_Leaf", "Split_Feature", "Predictability_Scor
 
 #### `reporter.leaf_summary() → pd.DataFrame`
 
-仅返回叶子节点的报告，结构同 `summary()`，适合快速查看最终聚类结果。
+Return only the leaf nodes report. Structure is the same as `summary()`, suitable for quickly viewing final clustering results.
 
 ```python
 leaves = reporter.leaf_summary()
 print(leaves[["Node_ID", "Rule", "Predictability_Score", "N_Samples", "Model_Weights"]])
 ```
 
-输出示例：
+**Example Output:**
 
 ```
  Node_ID                                              Rule  Predictability_Score  N_Samples
@@ -274,31 +360,27 @@ print(leaves[["Node_ID", "Rule", "Predictability_Score", "N_Samples", "Model_Wei
 
 #### `reporter.print_tree() → str`
 
-返回一个格式化的树结构文本字符串，使用缩进和 `├─` / `└─` 表示层级关系。
+Return a formatted tree structure text string using indentation and `├─` / `└─` to represent hierarchical relationships.
 
 ```python
 print(reporter.print_tree())
 ```
 
-输出示例：
+**Example Output:**
 
 ```
-[Node 0] char_1 < 0.5 (score=0.4569)
-  ├─ Left (< 0.5):
-    [Node 1] char_1 < 0.3 (score=0.0140)
-      ├─ Left (< 0.3):
-        [Leaf 3] n=2438 | r2=0.0147, mse=0.4769
-      └─ Right (>= 0.3):
-        [Leaf 4] n=1102 | r2=0.0018, mse=0.8028
-  └─ Right (>= 0.5):
-    [Leaf 5] n=6060 | r2=0.4640, mse=0.5483
+[Node 0] char_1 < 0.5 | r2=0.1234, n=12000 (Δ=0.4569)
+├── [Node 1] char_1 < 0.3 | r2=0.0523, n=5940 (Δ=0.0140)
+│   ├── [Leaf 3] r2=0.0147, mse=0.4769, n=2438
+│   └── [Leaf 4] r2=0.0018, mse=0.8028, n=1102
+└── [Leaf 5] r2=0.4640, mse=0.5483, n=6060
 ```
 
 ---
 
-### MosaicVisualizer 输出方法
+### MosaicVisualizer Methods
 
-`MosaicVisualizer` 用于生成"预测马赛克"——一张二维热力图，直观展示模型在不同时间点、不同资产群体中的预测能力。
+`MosaicVisualizer` generates "prediction mosaics" — 2D heatmaps that visually display the model's predictive power across different time periods and asset clusters.
 
 ```python
 from ptree import MosaicVisualizer
@@ -307,31 +389,31 @@ viz = MosaicVisualizer(engine)
 
 #### `viz.build_mosaic(X, y, time_col, metric) → pd.DataFrame`
 
-计算每个叶子节点在每个时间期的预测表现，返回一个 DataFrame。
+Compute per-leaf, per-period metric values and return a DataFrame.
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `X` | 处理后的面板 DataFrame（需包含 `time_col` 和特征列） |
-| `y` | 目标变量 |
-| `time_col` | 时间列名，默认 `"date"` |
-| `metric` | 评估指标：回归用 `"r2"`，分类用 `"precision"` / `"f1"` / `"auc"` |
+| `X` | Processed panel DataFrame (must include `time_col` and feature columns) |
+| `y` | Target variable |
+| `time_col` | Time column name, default `"date"` |
+| `metric` | Evaluation metric: `"r2"` for regression, `"precision"` / `"f1"` / `"auc"` for classification |
 
-返回值结构：
-- **行索引**：叶子节点 ID（`Leaf_ID`）
-- **列**：时间期（由 `time_col` 决定）
-- **值**：该叶子在该时间期的指标值
+**Return Structure:**
+- **Row index**: Leaf node IDs (`Leaf_ID`)
+- **Columns**: Time periods (determined by `time_col`)
+- **Values**: Metric value for that leaf in that period
 
 ```python
 mosaic = viz.build_mosaic(X_proc, y_proc, time_col="date", metric="r2")
 print(mosaic.shape)       # (n_leaves, n_periods)
-print(mosaic.iloc[:, :5]) # 预览前 5 期
+print(mosaic.iloc[:, :5]) # Preview first 5 periods
 
-# 分析哪些叶子在哪些时段表现最好
+# Analyse which leaves perform best in which periods
 best_leaf_per_period = mosaic.idxmax(axis=0)
 print(best_leaf_per_period)
 ```
 
-输出示例：
+**Example Output:**
 
 ```
          0         1         2         3         4
@@ -343,35 +425,35 @@ Leaf_ID
 
 #### `viz.plot_mosaic(mosaic, title, cmap, figsize, save_path) → (fig, ax)`
 
-将马赛克矩阵绘制为 seaborn 热力图。需要 `matplotlib` 和 `seaborn`。
+Render the mosaic matrix as a seaborn heatmap. Requires `matplotlib` and `seaborn`.
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `mosaic` | — | `build_mosaic()` 返回的 DataFrame |
-| `title` | `"Prediction Mosaic"` | 图表标题 |
-| `cmap` | `"RdYlGn"` | 色彩映射（红=差，绿=好） |
-| `figsize` | `(14, 6)` | 图表尺寸 |
-| `save_path` | `None` | 若指定路径，自动保存为 PNG |
+| `mosaic` | — | DataFrame returned by `build_mosaic()` |
+| `title` | `"Prediction Mosaic"` | Chart title |
+| `cmap` | `"RdYlGn"` | Colour map (red=poor, green=good) |
+| `figsize` | `(14, 6)` | Figure size |
+| `save_path` | `None` | If specified, automatically save as PNG |
 
 ```python
-# 交互查看
+# Interactive viewing
 fig, ax = viz.plot_mosaic(mosaic, title="P-Tree R² Mosaic")
 
-# 保存到文件
+# Save to file
 fig, ax = viz.plot_mosaic(mosaic, save_path="output/mosaic.png", cmap="coolwarm")
 ```
 
-热力图含义：
-- **横轴**：时间期 $t$
-- **纵轴**：各叶子节点
-- **颜色**：该叶子在该时间期的预测精度（R² 或 Precision）
-- 可一眼看出模型在哪些时间点、哪些资产群体中"失效"或"爆发"
+**Heatmap Interpretation:**
+- **X-axis**: Time period $t$
+- **Y-axis**: Leaf nodes
+- **Colour**: Predictive accuracy for that leaf in that period (R² or Precision)
+- Instantly reveals when and where the model "fails" or "excels"
 
 ---
 
-### 日志输出 (Verbose Logging)
+### Verbose Logging
 
-`PanelTreeEngine` 在 `verbose >= 1` 时会通过 Python `logging` 模块输出详细的分裂过程日志：
+`PanelTreeEngine` outputs detailed splitting process logs via Python's `logging` module when `verbose >= 1`:
 
 ```python
 import logging
@@ -381,7 +463,7 @@ engine = PanelTreeEngine(..., verbose=1)
 engine.fit(X, y, feature_names=...)
 ```
 
-日志示例：
+**Example Log Output:**
 
 ```
 [INFO] [Level 0] Splitting Node 0...
@@ -395,7 +477,7 @@ engine.fit(X, y, feature_names=...)
 [INFO] Tree built: 15 nodes, 8 leaves, max_depth=3
 ```
 
-设置 `verbose=2` 可查看每个 (feature, threshold) 候选组合的逐条评估结果。
+Set `verbose=2` to view per-candidate (feature, threshold) evaluation results.
 
 ---
 
@@ -411,6 +493,35 @@ engine.fit(X, y, feature_names=...)
 - `numpy`, `pandas`
 - `matplotlib`, `seaborn` (optional, for visualisation)
 
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+```bash
+# Clone the repository
+git clone https://github.com/ElenYoung/AssetPanelTree.git
+cd AssetPanelTree
+
+# Install in development mode
+pip install -e ".[dev]"
+
+# Run tests
+pytest test/ -v
+```
+
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+If you use P-Tree in your research, please consider citing:
+
+```bibtex
+@software{ptree2026,
+  author = {ElenYoung},
+  title = {P-Tree: Panel Tree for Supervised Clustering},
+  year = {2026},
+  url = {https://github.com/ElenYoung/AssetPanelTree}
+}
+```
