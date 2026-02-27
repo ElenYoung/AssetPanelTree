@@ -1,0 +1,12 @@
+include LICENSE
+include README.md
+include pyproject.toml
+
+recursive-include src/ptree *.py py.typed
+recursive-include example *.py
+recursive-include test *.py
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude .DS_Store

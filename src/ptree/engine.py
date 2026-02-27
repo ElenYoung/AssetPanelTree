@@ -1,0 +1,575 @@
+"""
+PanelTreeEngine: recursive splitting, pruning, feature-priority caching,
+incremental matrix updates, and multiprocessing support.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+import time
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
+import numpy as np
+import pandas as pd
+from multiprocessing import Pool, cpu_count
+
+from ptree.node import PanelTreeNode
+from ptree.predictors import (
+    PredictorBase,
+    RidgeRegressor,
+    VolWeightedRidgeRegressor,
+    RidgeLogitClassifier,
+    compute_XtWX_XtWy,
+)
+from ptree.criteria import (
+    CriterionBase,
+    R2DiffCriterion,
+    ClassificationCriterion,
+    evaluate_regression,
+    evaluate_classification,
+)
+
+logger = logging.getLogger("ptree")
+
+
+# ======================================================================
+# Engine
+# ======================================================================
+
+class PanelTreeEngine:
+    """Build and query a Panel Tree.
+
+    Parameters
+    ----------
+    predictor : PredictorBase or Type[PredictorBase]
+        Instance or class of the leaf-node predictor.  If a class is given,
+        it will be instantiated with ``predictor_params``.
+    criterion : CriterionBase
+        Splitting-quality criterion.
+    split_thresholds : list of float, default [0.3, 0.5, 0.7]
+        Candidate thresholds applied to (possibly rank-standardised) features.
+    max_depth : int, default 3
+        Maximum tree depth.
+    min_samples : int, default 100
+        Minimum samples in a node for it to be considered for splitting.
+        Also used to skip feature-threshold combos that produce too-small
+        child nodes.
+    fast_mode : bool, default False
+        Enable *Feature Persistence* – prioritise top-ranked features from
+        the parent node in child-node searches.
+    early_stopping_threshold : float or None
+        If ``fast_mode`` is True and the best candidate so far exceeds this
+        threshold, skip remaining features.  Ignored when ``fast_mode`` is
+        False.
+    n_jobs : int, default 1
+        Number of parallel workers at the *node* level (``multiprocessing``).
+        Set to ``-1`` to use all CPU cores.
+    verbose : int, default 1
+        Logging verbosity (0 = silent, 1 = per-level, 2 = per-candidate).
+    """
+
+    def __init__(
+        self,
+        predictor: Union[PredictorBase, Type[PredictorBase]] = RidgeRegressor,
+        criterion: CriterionBase = R2DiffCriterion(),
+        split_thresholds: Optional[List[float]] = None,
+        max_depth: int = 3,
+        min_samples: int = 100,
+        fast_mode: bool = False,
+        early_stopping_threshold: Optional[float] = None,
+        n_jobs: int = 1,
+        verbose: int = 1,
+        predictor_params: Optional[Dict] = None,
+    ):
+        # Predictor template
+        if isinstance(predictor, type):
+            params = predictor_params or {}
+            self._predictor_template = predictor(**params)
+        else:
+            self._predictor_template = predictor
+
+        self.criterion = criterion
+        self.split_thresholds = split_thresholds or [0.3, 0.5, 0.7]
+        self.max_depth = max_depth
+        self.min_samples = min_samples
+        self.fast_mode = fast_mode
+        self.early_stopping_threshold = early_stopping_threshold
+        self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
+        self.verbose = verbose
+
+        # State populated after fitting
+        self.root_: Optional[PanelTreeNode] = None
+        self._node_counter: int = 0
+        self._total_samples: int = 0
+        self._feature_names: List[str] = []
+        self._is_classification: bool = isinstance(
+            self.criterion, ClassificationCriterion
+        )
+        # Store processed data for predictions & cluster retrieval
+        self._X: Optional[np.ndarray] = None
+        self._y: Optional[np.ndarray] = None
+        self._weights: Optional[np.ndarray] = None
+        self._X_df: Optional[pd.DataFrame] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        feature_names: List[str],
+        weights: Optional[np.ndarray] = None,
+    ) -> "PanelTreeEngine":
+        """Build the Panel Tree.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Processed panel data (with time/entity columns plus features).
+        y : Series
+            Target variable aligned with *X*.
+        feature_names : list of str
+            Names of the feature columns used for splitting and prediction.
+        weights : ndarray or None
+            Observation weights (e.g. inverse-volatility).
+        """
+        self._feature_names = list(feature_names)
+        X_arr = X[feature_names].values.astype(np.float64)
+        y_arr = y.values.astype(np.float64)
+        self._total_samples = len(y_arr)
+        self._X = X_arr
+        self._y = y_arr
+        self._weights = weights.values if isinstance(weights, pd.Series) else weights
+        self._X_df = X
+        self._node_counter = 0
+
+        all_indices = np.arange(self._total_samples)
+
+        self.root_ = self._build_node(
+            indices=all_indices,
+            depth=0,
+            rule="root",
+            parent_id=None,
+            parent_ranking=None,
+        )
+
+        if self.verbose >= 1:
+            leaves = self.get_leaves()
+            logger.info(
+                "Tree built: %d nodes, %d leaves, max_depth=%d",
+                self._node_counter,
+                len(leaves),
+                self.max_depth,
+            )
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Generate predictions using fitted leaf models.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Must contain the same feature columns used during ``fit``.
+
+        Returns
+        -------
+        preds : ndarray of shape (n,)
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        X_arr = X[self._feature_names].values.astype(np.float64)
+        preds = np.full(X_arr.shape[0], np.nan)
+        self._predict_recursive(self.root_, X_arr, np.arange(len(X_arr)), preds)
+        return preds
+
+    def get_leaves(self) -> List[PanelTreeNode]:
+        """Return all leaf nodes."""
+        assert self.root_ is not None
+        leaves: List[PanelTreeNode] = []
+        self._collect_leaves(self.root_, leaves)
+        return leaves
+
+    def get_all_nodes(self) -> List[PanelTreeNode]:
+        """Return all nodes (BFS order)."""
+        assert self.root_ is not None
+        nodes: List[PanelTreeNode] = []
+        queue = [self.root_]
+        while queue:
+            node = queue.pop(0)
+            nodes.append(node)
+            if node.left is not None:
+                queue.append(node.left)
+            if node.right is not None:
+                queue.append(node.right)
+        return nodes
+
+    def get_node_report(self) -> pd.DataFrame:
+        """Return a structured DataFrame summarising every node."""
+        nodes = self.get_all_nodes()
+        return pd.DataFrame([n.to_dict() for n in nodes])
+
+    def get_leaf_samples(self) -> Dict[int, np.ndarray]:
+        """Map leaf ``node_id`` → original sample indices."""
+        return {leaf.node_id: leaf.sample_indices for leaf in self.get_leaves()}
+
+    # ------------------------------------------------------------------
+    # Tree construction (recursive)
+    # ------------------------------------------------------------------
+
+    def _next_id(self) -> int:
+        nid = self._node_counter
+        self._node_counter += 1
+        return nid
+
+    def _build_node(
+        self,
+        indices: np.ndarray,
+        depth: int,
+        rule: str,
+        parent_id: Optional[int],
+        parent_ranking: Optional[List[tuple]],
+    ) -> PanelTreeNode:
+        t0 = time.time()
+        node_id = self._next_id()
+
+        node = PanelTreeNode(
+            node_id=node_id,
+            depth=depth,
+            sample_indices=indices,
+            rule=rule,
+            parent_id=parent_id,
+            sample_ratio=len(indices) / max(self._total_samples, 1),
+        )
+
+        # Fit local predictor on this node
+        X_node = self._X[indices]
+        y_node = self._y[indices]
+        w_node = self._weights[indices] if self._weights is not None else None
+
+        predictor = self._make_predictor()
+        predictor.fit(X_node, y_node, weights=w_node)
+        node.predictor = predictor
+        node.metrics = self._evaluate(X_node, y_node, predictor, w_node)
+
+        # Compute and cache sufficient statistics (for Ridge incremental updates)
+        if isinstance(predictor, (RidgeRegressor, VolWeightedRidgeRegressor)):
+            XtWX, XtWy = compute_XtWX_XtWy(
+                np.column_stack([np.ones(X_node.shape[0]), X_node])
+                if getattr(predictor, "fit_intercept", True)
+                else X_node,
+                y_node,
+                w_node,
+            )
+            node._XtWX = XtWX
+            node._XtWy = XtWy
+
+        # Check stopping conditions
+        if depth >= self.max_depth or len(indices) < 2 * self.min_samples:
+            node.is_leaf = True
+            node.elapsed_time = time.time() - t0
+            return node
+
+        # Search for the best split
+        best = self._find_best_split(
+            indices, X_node, y_node, w_node, depth, parent_ranking, node,
+        )
+
+        if best is None:
+            node.is_leaf = True
+            node.elapsed_time = time.time() - t0
+            return node
+
+        feat_idx, threshold, score, ranking = best
+        feat_name = self._feature_names[feat_idx]
+        node.is_leaf = False
+        node.split_feature = feat_name
+        node.split_threshold = threshold
+        node.split_score = score
+        node.feature_ranking = ranking
+
+        # Partition
+        mask_left = X_node[:, feat_idx] < threshold
+        left_idx = indices[mask_left]
+        right_idx = indices[~mask_left]
+
+        left_rule = f"{rule} & {feat_name} < {threshold}"
+        right_rule = f"{rule} & {feat_name} >= {threshold}"
+
+        if self.verbose >= 1:
+            self._log_split(node, feat_name, threshold, score, len(left_idx), len(right_idx))
+
+        node.left = self._build_node(
+            left_idx, depth + 1, left_rule, node_id, ranking
+        )
+        node.right = self._build_node(
+            right_idx, depth + 1, right_rule, node_id, ranking
+        )
+
+        node.elapsed_time = time.time() - t0
+        return node
+
+    # ------------------------------------------------------------------
+    # Split search
+    # ------------------------------------------------------------------
+
+    def _find_best_split(
+        self,
+        indices: np.ndarray,
+        X_node: np.ndarray,
+        y_node: np.ndarray,
+        w_node: Optional[np.ndarray],
+        depth: int,
+        parent_ranking: Optional[List[tuple]],
+        node: PanelTreeNode,
+    ) -> Optional[Tuple[int, float, float, List[tuple]]]:
+        """Search all (feature, threshold) combinations and return the best.
+
+        Returns ``None`` if no valid split is found.
+
+        Returns
+        -------
+        (feature_index, threshold, criterion_score, ranking_list) or None
+        """
+        n_features = X_node.shape[1]
+        thresholds = self.split_thresholds
+
+        # Determine feature evaluation order (priority caching)
+        if self.fast_mode and parent_ranking is not None:
+            # Prioritise top 50% features from parent
+            top_k = max(1, len(parent_ranking) // 2)
+            priority_feats = [r[0] for r in parent_ranking[:top_k]]
+            remaining = [i for i in range(n_features) if i not in priority_feats]
+            eval_order = priority_feats + remaining
+        else:
+            eval_order = list(range(n_features))
+
+        ranking: List[tuple] = []
+        best_score = -np.inf
+        best_split: Optional[Tuple[int, float]] = None
+        early_stopped = False
+
+        for feat_idx in eval_order:
+            for thr in thresholds:
+                mask_left = X_node[:, feat_idx] < thr
+                n_left = int(mask_left.sum())
+                n_right = len(mask_left) - n_left
+
+                # Skip if either child would be too small
+                if n_left < self.min_samples or n_right < self.min_samples:
+                    continue
+
+                # Fit child predictors
+                left_metrics = self._fit_and_evaluate_subset(
+                    indices[mask_left], X_node[mask_left], y_node[mask_left],
+                    w_node[mask_left] if w_node is not None else None,
+                    parent_node=node,
+                    is_left=True,
+                    feat_idx=feat_idx,
+                    mask=mask_left,
+                    X_full=X_node,
+                    y_full=y_node,
+                    w_full=w_node,
+                )
+                right_metrics = self._fit_and_evaluate_subset(
+                    indices[~mask_left], X_node[~mask_left], y_node[~mask_left],
+                    w_node[~mask_left] if w_node is not None else None,
+                    parent_node=node,
+                    is_left=False,
+                    feat_idx=feat_idx,
+                    mask=mask_left,
+                    X_full=X_node,
+                    y_full=y_node,
+                    w_full=w_node,
+                )
+
+                score = self.criterion.calculate_score(left_metrics, right_metrics)
+                ranking.append((feat_idx, thr, score))
+
+                if self.verbose >= 2:
+                    logger.debug(
+                        "  [depth=%d] %s < %.2f  score=%.6f  (L:%d R:%d)",
+                        depth, self._feature_names[feat_idx], thr, score,
+                        n_left, n_right,
+                    )
+
+                if score > best_score:
+                    best_score = score
+                    best_split = (feat_idx, thr)
+
+            # Early stopping (fast mode)
+            if (
+                self.fast_mode
+                and self.early_stopping_threshold is not None
+                and best_score >= self.early_stopping_threshold
+                and feat_idx in (eval_order[: max(1, len(eval_order) // 2)])
+            ):
+                early_stopped = True
+                if self.verbose >= 1:
+                    logger.info(
+                        "  [depth=%d] Early stopping: score %.4f >= threshold %.4f",
+                        depth, best_score, self.early_stopping_threshold,
+                    )
+                break
+
+        # Sort ranking descending by score
+        ranking.sort(key=lambda x: x[2], reverse=True)
+
+        if best_split is None:
+            return None
+
+        return (best_split[0], best_split[1], best_score, ranking)
+
+    def _fit_and_evaluate_subset(
+        self,
+        indices: np.ndarray,
+        X_sub: np.ndarray,
+        y_sub: np.ndarray,
+        w_sub: Optional[np.ndarray],
+        parent_node: PanelTreeNode,
+        is_left: bool,
+        feat_idx: int,
+        mask: np.ndarray,
+        X_full: np.ndarray,
+        y_full: np.ndarray,
+        w_full: Optional[np.ndarray],
+    ) -> Dict[str, float]:
+        """Fit a predictor on a subset and return evaluation metrics.
+
+        Uses incremental matrix subtraction when the parent node has cached
+        sufficient statistics (Redundancy Saving optimisation).
+        """
+        predictor = self._make_predictor()
+
+        # Attempt incremental matrix update for Ridge models
+        incremental = False
+        if (
+            isinstance(predictor, (RidgeRegressor, VolWeightedRidgeRegressor))
+            and parent_node._XtWX is not None
+        ):
+            # Compute the *other* side's statistics and subtract from parent
+            other_mask = ~mask if is_left else mask
+            X_other = X_full[other_mask]
+            y_other = y_full[other_mask]
+            w_other = w_full[other_mask] if w_full is not None else None
+
+            fit_intercept = getattr(predictor, "fit_intercept", True)
+            if isinstance(predictor, VolWeightedRidgeRegressor):
+                fit_intercept = getattr(predictor._inner, "fit_intercept", True)
+
+            if fit_intercept:
+                X_other_aug = np.column_stack([np.ones(X_other.shape[0]), X_other])
+                X_sub_aug = np.column_stack([np.ones(X_sub.shape[0]), X_sub])
+            else:
+                X_other_aug = X_other
+                X_sub_aug = X_sub
+
+            XtWX_other, XtWy_other = compute_XtWX_XtWy(
+                X_other_aug, y_other, w_other
+            )
+            XtWX_sub = parent_node._XtWX - XtWX_other
+            XtWy_sub = parent_node._XtWy - XtWy_other
+
+            predictor.fit(X_sub, y_sub, weights=w_sub, XtWX=XtWX_sub, XtWy=XtWy_sub)
+            incremental = True
+
+        if not incremental:
+            predictor.fit(X_sub, y_sub, weights=w_sub)
+
+        return self._evaluate(X_sub, y_sub, predictor, w_sub)
+
+    # ------------------------------------------------------------------
+    # Evaluation dispatch
+    # ------------------------------------------------------------------
+
+    def _evaluate(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        predictor: PredictorBase,
+        weights: Optional[np.ndarray],
+    ) -> Dict[str, float]:
+        if self._is_classification:
+            if hasattr(predictor, "predict_proba"):
+                proba = predictor.predict_proba(X)
+            else:
+                proba = predictor.predict(X)
+            metrics = evaluate_classification(y, proba)
+        else:
+            y_pred = predictor.predict(X)
+            metrics = evaluate_regression(y, y_pred, weights)
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Prediction (recursive)
+    # ------------------------------------------------------------------
+
+    def _predict_recursive(
+        self,
+        node: PanelTreeNode,
+        X_arr: np.ndarray,
+        row_indices: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        if node.is_leaf:
+            if node.predictor is not None and len(row_indices) > 0:
+                preds = node.predictor.predict(X_arr[row_indices])
+                out[row_indices] = preds
+            return
+
+        feat_idx = self._feature_names.index(node.split_feature)
+        vals = X_arr[row_indices, feat_idx]
+        mask_left = vals < node.split_threshold
+
+        if node.left is not None:
+            self._predict_recursive(node.left, X_arr, row_indices[mask_left], out)
+        if node.right is not None:
+            self._predict_recursive(node.right, X_arr, row_indices[~mask_left], out)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_predictor(self) -> PredictorBase:
+        """Create a fresh copy of the predictor template."""
+        return copy.deepcopy(self._predictor_template)
+
+    @staticmethod
+    def _collect_leaves(node: PanelTreeNode, acc: List[PanelTreeNode]) -> None:
+        if node.is_leaf:
+            acc.append(node)
+        else:
+            if node.left is not None:
+                PanelTreeEngine._collect_leaves(node.left, acc)
+            if node.right is not None:
+                PanelTreeEngine._collect_leaves(node.right, acc)
+
+    def _log_split(
+        self,
+        node: PanelTreeNode,
+        feat: str,
+        thr: float,
+        score: float,
+        n_left: int,
+        n_right: int,
+    ) -> None:
+        key = self.criterion.metric_key()
+        m_left = node.metrics.get(key, float("nan"))
+        logger.info(
+            "[Level %d] Splitting Node %d...\n"
+            "  - Best Split: '%s' at threshold %.4f\n"
+            "  - Metric Delta: score = %.6f\n"
+            "  - Left: %d samples | Right: %d samples",
+            node.depth, node.node_id,
+            feat, thr, score,
+            n_left, n_right,
+        )
