@@ -42,8 +42,10 @@ from ptree.predictors import (
 from ptree.criteria import (
     CriterionBase,
     R2DiffCriterion,
+    WeightedR2DiffCriterion,
     ClassificationCriterion,
 )
+
 from ptree.node import PanelTreeNode
 from ptree.engine import PanelTreeEngine
 from ptree.visualization import MosaicVisualizer, NodeReporter
@@ -63,7 +65,9 @@ __all__ = [
     # Criteria
     "CriterionBase",
     "R2DiffCriterion",
+    "WeightedR2DiffCriterion",
     "ClassificationCriterion",
+
     # Core classes
     "PanelTreeNode",
     "PanelTreeEngine",

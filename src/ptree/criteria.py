@@ -93,9 +93,92 @@ class R2DiffCriterion(CriterionBase):
         return f"R2DiffCriterion(weight_by_size={self.weight_by_size})"
 
 
+class WeightedR2DiffCriterion(CriterionBase):
+    """Academically-weighted variant of :class:`R2DiffCriterion`.
+
+    Keeps the ``|R^2_L - R^2_R|`` core of the default criterion but multiplies
+    it by stabilising factors that temper spuriously-high R² on small or
+    imbalanced child nodes (a common source of over-fitting in greedy panel
+    splits).  The default criterion's behaviour is intentionally *not* changed;
+    this is an opt-in, stricter alternative.
+
+    .. math::
+        \\text{score} = |R^2_L - R^2_R|
+            \\cdot \\underbrace{\\frac{\\min(n_L, n_R)}{n_L + n_R}}_{\\text{balance}}
+            \\cdot \\underbrace{\\frac{n_{\\min} - 1}{n_{\\min} - 1 + k}}_{\\text{shrinkage}}
+
+    Parameters
+    ----------
+    balance : bool, default True
+        Apply the ``min(n_L, n_R) / (n_L + n_R)`` balance penalty.
+    shrinkage_k : float, default 0.0
+        Sample-size shrinkage strength applied via the smaller node's count.
+        ``0`` disables shrinkage; larger values penalise small nodes harder.
+    use_adjusted_r2 : bool, default False
+        If True, degrade each child's R² toward an adjusted-R² using the model
+        dimensionality ``p`` recorded in the metrics (``n_features``), guarding
+        against high R² merely from many regressors on few samples.
+    """
+
+    def __init__(
+        self,
+        balance: bool = True,
+        shrinkage_k: float = 0.0,
+        use_adjusted_r2: bool = False,
+    ):
+        self.balance = balance
+        self.shrinkage_k = shrinkage_k
+        self.use_adjusted_r2 = use_adjusted_r2
+
+    @staticmethod
+    def _adjusted_r2(r2: float, n: int, p: int) -> float:
+        denom = n - p - 1
+        if denom <= 0:
+            return r2
+        return 1.0 - (1.0 - r2) * (n - 1) / denom
+
+    def calculate_score(
+        self,
+        left_metrics: Dict[str, float],
+        right_metrics: Dict[str, float],
+    ) -> float:
+        r2_l = left_metrics.get("r2", 0.0)
+        r2_r = right_metrics.get("r2", 0.0)
+        n_l = int(left_metrics.get("n_samples", 1))
+        n_r = int(right_metrics.get("n_samples", 1))
+
+        if self.use_adjusted_r2:
+            p_l = int(left_metrics.get("n_features", 0))
+            p_r = int(right_metrics.get("n_features", 0))
+            r2_l = self._adjusted_r2(r2_l, n_l, p_l)
+            r2_r = self._adjusted_r2(r2_r, n_r, p_r)
+
+        diff = abs(r2_l - r2_r)
+
+        if self.balance:
+            diff *= min(n_l, n_r) / max(n_l + n_r, 1)
+
+        if self.shrinkage_k > 0.0:
+            n_min = min(n_l, n_r)
+            diff *= max(n_min - 1, 0) / max(n_min - 1 + self.shrinkage_k, 1e-12)
+
+        return diff
+
+    def metric_key(self) -> str:
+        return "r2"
+
+    def __repr__(self) -> str:
+        return (
+            f"WeightedR2DiffCriterion(balance={self.balance}, "
+            f"shrinkage_k={self.shrinkage_k}, "
+            f"use_adjusted_r2={self.use_adjusted_r2})"
+        )
+
+
 # ======================================================================
 # Classification: Precision / F1 / AUC difference
 # ======================================================================
+
 
 class ClassificationCriterion(CriterionBase):
     """Maximise the difference in a classification metric across child nodes.
@@ -177,7 +260,14 @@ def evaluate_regression(
 
     r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
     mse = ss_res / max(np.sum(weights), 1e-12)
-    return {"r2": float(r2), "mse": float(mse), "n_samples": n}
+    n_features = int(y_pred.shape[1]) if y_pred.ndim > 1 else 0
+    return {
+        "r2": float(r2),
+        "mse": float(mse),
+        "n_samples": n,
+        "n_features": n_features,
+    }
+
 
 
 def evaluate_classification(
