@@ -1,6 +1,6 @@
 # Panel Tree (P-Tree)
 
-[![PyPI version](https://badge.fury.io/py/ptree-panel.svg)](https://pypi.org/project/ptree-panel/)
+[![PyPI version](https://badge.fury.io/py/aptree.svg)](https://pypi.org/project/aptree/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -9,14 +9,16 @@ A **supervised clustering algorithm** designed for **panel data**, commonly used
 ## Installation
 
 ```bash
-pip install ptree-panel
+pip install aptree
 
 # With visualization support (matplotlib, seaborn)
-pip install ptree-panel[viz]
+pip install aptree[viz]
 
 # For development
-pip install ptree-panel[dev]
+pip install aptree[dev]
 ```
+
+> **Note:** The PyPI distribution name is `aptree`, while the import name remains `ptree` (e.g. `from ptree import PanelTreeEngine`).
 
 ## Core Idea
 
