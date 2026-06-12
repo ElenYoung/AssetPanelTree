@@ -74,6 +74,10 @@ class PanelTreeNode:
     # Cached sufficient statistics for incremental matrix updates
     _XtWX: Optional[np.ndarray] = field(default=None, repr=False)
     _XtWy: Optional[np.ndarray] = field(default=None, repr=False)
+    # Cached integer column index of ``split_feature`` (avoids O(p) lookups
+    # during prediction).  Populated by the engine after a split is chosen.
+    _split_feature_idx: Optional[int] = field(default=None, repr=False)
+
 
     # ------------------------------------------------------------------
     # Convenience helpers

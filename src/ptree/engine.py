@@ -89,7 +89,9 @@ class PanelTreeEngine:
         n_jobs: int = 1,
         verbose: int = 1,
         predictor_params: Optional[Dict] = None,
+        keep_node_stats: bool = False,
     ):
+
         # Predictor template
         if isinstance(predictor, type):
             params = predictor_params or {}
@@ -105,6 +107,8 @@ class PanelTreeEngine:
         self.early_stopping_threshold = early_stopping_threshold
         self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
         self.verbose = verbose
+        self.keep_node_stats = keep_node_stats
+
 
         # State populated after fitting
         self.root_: Optional[PanelTreeNode] = None
@@ -296,6 +300,8 @@ class PanelTreeEngine:
         node.split_threshold = threshold
         node.split_score = score
         node.feature_ranking = ranking
+        node._split_feature_idx = feat_idx  # cache for O(1) prediction routing
+
 
         # Partition
         mask_left = X_node[:, feat_idx] < threshold
@@ -315,8 +321,15 @@ class PanelTreeEngine:
             right_idx, depth + 1, right_rule, node_id, ranking
         )
 
+        # A5: release cached sufficient statistics once both children are built
+        # (no longer needed for incremental updates).  Keeps deep trees lean.
+        if not self.keep_node_stats:
+            node._XtWX = None
+            node._XtWy = None
+
         node.elapsed_time = time.time() - t0
         return node
+
 
     # ------------------------------------------------------------------
     # Split search
@@ -368,31 +381,15 @@ class PanelTreeEngine:
                 if n_left < self.min_samples or n_right < self.min_samples:
                     continue
 
-                # Fit child predictors
-                left_metrics = self._fit_and_evaluate_subset(
-                    indices[mask_left], X_node[mask_left], y_node[mask_left],
-                    w_node[mask_left] if w_node is not None else None,
-                    parent_node=node,
-                    is_left=True,
-                    feat_idx=feat_idx,
-                    mask=mask_left,
-                    X_full=X_node,
-                    y_full=y_node,
-                    w_full=w_node,
-                )
-                right_metrics = self._fit_and_evaluate_subset(
-                    indices[~mask_left], X_node[~mask_left], y_node[~mask_left],
-                    w_node[~mask_left] if w_node is not None else None,
-                    parent_node=node,
-                    is_left=False,
-                    feat_idx=feat_idx,
-                    mask=mask_left,
-                    X_full=X_node,
-                    y_full=y_node,
-                    w_full=w_node,
+                # Fit both child predictors (incremental: compute only the
+                # smaller side's sufficient statistics, derive the larger by
+                # subtracting from the parent's cached statistics).
+                left_metrics, right_metrics = self._fit_and_evaluate_children(
+                    X_node, y_node, w_node, mask_left, parent_node=node,
                 )
 
                 score = self.criterion.calculate_score(left_metrics, right_metrics)
+
                 ranking.append((feat_idx, thr, score))
 
                 if self.verbose >= 2:
@@ -429,63 +426,90 @@ class PanelTreeEngine:
 
         return (best_split[0], best_split[1], best_score, ranking)
 
-    def _fit_and_evaluate_subset(
+    def _fit_and_evaluate_children(
         self,
-        indices: np.ndarray,
-        X_sub: np.ndarray,
-        y_sub: np.ndarray,
-        w_sub: Optional[np.ndarray],
+        X_node: np.ndarray,
+        y_node: np.ndarray,
+        w_node: Optional[np.ndarray],
+        mask_left: np.ndarray,
         parent_node: PanelTreeNode,
-        is_left: bool,
-        feat_idx: int,
-        mask: np.ndarray,
-        X_full: np.ndarray,
-        y_full: np.ndarray,
-        w_full: Optional[np.ndarray],
-    ) -> Dict[str, float]:
-        """Fit a predictor on a subset and return evaluation metrics.
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Fit *both* child predictors for one candidate split and evaluate.
 
-        Uses incremental matrix subtraction when the parent node has cached
-        sufficient statistics (Redundancy Saving optimisation).
+        Incremental optimisation (A1): when the parent node has cached Ridge
+        sufficient statistics, only the *smaller* child's ``XtWX`` / ``XtWy``
+        are computed directly (one matmul); the *larger* child's statistics
+        are obtained by subtracting the smaller from the parent's cached
+        statistics (a cheap ``O(p^2)`` subtraction).  This halves the matmul
+        work of the previous implementation, which redundantly computed both
+        sides in full.
+
+        Returns ``(left_metrics, right_metrics)``.
         """
-        predictor = self._make_predictor()
+        mask_right = ~mask_left
+        X_left, y_left = X_node[mask_left], y_node[mask_left]
+        X_right, y_right = X_node[mask_right], y_node[mask_right]
+        w_left = w_node[mask_left] if w_node is not None else None
+        w_right = w_node[mask_right] if w_node is not None else None
 
-        # Attempt incremental matrix update for Ridge models
-        incremental = False
-        if (
-            isinstance(predictor, (RidgeRegressor, VolWeightedRidgeRegressor))
+        left_predictor = self._make_predictor()
+        right_predictor = self._make_predictor()
+
+        use_incremental = (
+            isinstance(left_predictor, (RidgeRegressor, VolWeightedRidgeRegressor))
             and parent_node._XtWX is not None
-        ):
-            # Compute the *other* side's statistics and subtract from parent
-            other_mask = ~mask if is_left else mask
-            X_other = X_full[other_mask]
-            y_other = y_full[other_mask]
-            w_other = w_full[other_mask] if w_full is not None else None
+        )
 
-            fit_intercept = getattr(predictor, "fit_intercept", True)
-            if isinstance(predictor, VolWeightedRidgeRegressor):
-                fit_intercept = getattr(predictor._inner, "fit_intercept", True)
+        if use_incremental:
+            fit_intercept = getattr(left_predictor, "fit_intercept", True)
+            if isinstance(left_predictor, VolWeightedRidgeRegressor):
+                fit_intercept = getattr(left_predictor._inner, "fit_intercept", True)
 
-            if fit_intercept:
-                X_other_aug = np.column_stack([np.ones(X_other.shape[0]), X_other])
-                X_sub_aug = np.column_stack([np.ones(X_sub.shape[0]), X_sub])
+            # Compute sufficient statistics for the *smaller* side only.
+            n_left = int(X_left.shape[0])
+            n_right = int(X_right.shape[0])
+            small_is_left = n_left <= n_right
+
+            if small_is_left:
+                Xs, ys, ws = X_left, y_left, w_left
             else:
-                X_other_aug = X_other
-                X_sub_aug = X_sub
+                Xs, ys, ws = X_right, y_right, w_right
 
-            XtWX_other, XtWy_other = compute_XtWX_XtWy(
-                X_other_aug, y_other, w_other
+            Xs_aug = (
+                np.column_stack([np.ones(Xs.shape[0]), Xs])
+                if fit_intercept
+                else Xs
             )
-            XtWX_sub = parent_node._XtWX - XtWX_other
-            XtWy_sub = parent_node._XtWy - XtWy_other
+            XtWX_small, XtWy_small = compute_XtWX_XtWy(Xs_aug, ys, ws)
+            XtWX_large = parent_node._XtWX - XtWX_small
+            XtWy_large = parent_node._XtWy - XtWy_small
 
-            predictor.fit(X_sub, y_sub, weights=w_sub, XtWX=XtWX_sub, XtWy=XtWy_sub)
-            incremental = True
+            if small_is_left:
+                left_predictor.fit(
+                    X_left, y_left, weights=w_left,
+                    XtWX=XtWX_small, XtWy=XtWy_small,
+                )
+                right_predictor.fit(
+                    X_right, y_right, weights=w_right,
+                    XtWX=XtWX_large, XtWy=XtWy_large,
+                )
+            else:
+                right_predictor.fit(
+                    X_right, y_right, weights=w_right,
+                    XtWX=XtWX_small, XtWy=XtWy_small,
+                )
+                left_predictor.fit(
+                    X_left, y_left, weights=w_left,
+                    XtWX=XtWX_large, XtWy=XtWy_large,
+                )
+        else:
+            left_predictor.fit(X_left, y_left, weights=w_left)
+            right_predictor.fit(X_right, y_right, weights=w_right)
 
-        if not incremental:
-            predictor.fit(X_sub, y_sub, weights=w_sub)
+        left_metrics = self._evaluate(X_left, y_left, left_predictor, w_left)
+        right_metrics = self._evaluate(X_right, y_right, right_predictor, w_right)
+        return left_metrics, right_metrics
 
-        return self._evaluate(X_sub, y_sub, predictor, w_sub)
 
     # ------------------------------------------------------------------
     # Evaluation dispatch
@@ -526,8 +550,13 @@ class PanelTreeEngine:
                 out[row_indices] = preds
             return
 
-        feat_idx = self._feature_names.index(node.split_feature)
+        # A6: use the cached integer index (falls back to a name lookup for
+        # trees built before this field existed, e.g. unpickled old models).
+        feat_idx = node._split_feature_idx
+        if feat_idx is None:
+            feat_idx = self._feature_names.index(node.split_feature)
         vals = X_arr[row_indices, feat_idx]
+
         mask_left = vals < node.split_threshold
 
         if node.left is not None:

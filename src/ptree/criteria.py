@@ -216,12 +216,42 @@ def evaluate_classification(
 
 
 def _auc_mannwhitney(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Compute AUC via the Mann-Whitney U statistic (no sklearn dependency)."""
-    pos = y_score[y_true == 1]
-    neg = y_score[y_true == 0]
-    if len(pos) == 0 or len(neg) == 0:
+    """Compute AUC via the Mann-Whitney U statistic (no sklearn dependency).
+
+    Vectorised ``O(n log n)`` rank-based implementation (replaces the former
+    ``O(n_pos * n_neg)`` double loop).  Ties in ``y_score`` are handled by
+    average ranks, which is exactly equivalent to the ``+0.5`` tie correction
+    of the brute-force Mann-Whitney U.
+    """
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    n_pos = int(np.sum(y_true == 1))
+    n_neg = int(y_true.shape[0] - n_pos)
+    if n_pos == 0 or n_neg == 0:
         return 0.5
-    u = 0.0
-    for p in pos:
-        u += np.sum(p > neg) + 0.5 * np.sum(p == neg)
-    return float(u / (len(pos) * len(neg)))
+
+    # Average ranks (1-based) with fully-vectorised tie handling.
+    order = np.argsort(y_score, kind="mergesort")
+    sorted_scores = y_score[order]
+    n = y_score.shape[0]
+
+    # Group boundaries: a new tie-group starts wherever the score changes.
+    is_group_start = np.empty(n, dtype=bool)
+    is_group_start[0] = True
+    np.not_equal(sorted_scores[1:], sorted_scores[:-1], out=is_group_start[1:])
+    group_id = np.cumsum(is_group_start) - 1  # 0-based group index per position
+
+    # For each group, the average 1-based rank is the mean of its positions+1.
+    group_starts = np.flatnonzero(is_group_start)  # first position of each group
+    group_ends = np.append(group_starts[1:], n)    # one-past-last position
+    # Average of 1-based ranks over [start, end): 0.5*(start + end - 1) + 1.
+    group_avg_rank = 0.5 * (group_starts + group_ends - 1) + 1.0
+
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = group_avg_rank[group_id]
+
+    sum_ranks_pos = float(np.sum(ranks[y_true == 1]))
+
+    u = sum_ranks_pos - n_pos * (n_pos + 1) / 2.0
+    return float(u / (n_pos * n_neg))
+

@@ -12,6 +12,14 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
+try:  # SciPy provides a faster, more stable SPD solve (Cholesky).
+    from scipy.linalg import cho_factor, cho_solve
+
+    _HAS_SCIPY = True
+except ImportError:  # pragma: no cover - exercised only without SciPy
+    _HAS_SCIPY = False
+
+
 
 # ======================================================================
 # Base class
@@ -81,14 +89,31 @@ def _ridge_closed_form(
     Returns
     -------
     beta : (p,)
+
+    Notes
+    -----
+    ``A = XtWX + alpha I`` is symmetric positive-definite for ``alpha > 0``,
+    so a Cholesky factorisation is both faster and more numerically stable
+    than a general LU solve.  We prefer SciPy's ``cho_factor`` / ``cho_solve``
+    when available and fall back to ``np.linalg.solve`` → ``lstsq`` otherwise.
+    The result is numerically equivalent to the previous LU solve.
     """
     p = XtWX.shape[0]
     A = XtWX + alpha * np.eye(p)
+
+    if _HAS_SCIPY:
+        try:
+            c, low = cho_factor(A, check_finite=False)
+            return cho_solve((c, low), XtWy, check_finite=False)
+        except (np.linalg.LinAlgError, ValueError):
+            # Not SPD (e.g. alpha == 0 with rank deficiency) → fall through.
+            pass
+
     try:
-        beta = np.linalg.solve(A, XtWy)
+        return np.linalg.solve(A, XtWy)
     except np.linalg.LinAlgError:
-        beta = np.linalg.lstsq(A, XtWy, rcond=None)[0]
-    return beta
+        return np.linalg.lstsq(A, XtWy, rcond=None)[0]
+
 
 
 def compute_XtWX_XtWy(
