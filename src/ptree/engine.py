@@ -267,8 +267,139 @@ class PanelTreeEngine:
         return {leaf.node_id: leaf.sample_indices for leaf in self.get_leaves()}
 
     # ------------------------------------------------------------------
+    # Cost-complexity pruning (B3, post-fit)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _subtree_stats(node: PanelTreeNode) -> Tuple[float, int]:
+        """Return ``(total_split_score, n_leaves)`` for the subtree at *node*.
+
+        ``total_split_score`` is the sum of ``split_score`` over the internal
+        nodes of the subtree — the cumulative predictability gain the subtree
+        contributes over collapsing it to a single leaf.
+        """
+        if node.is_leaf:
+            return 0.0, 1
+        score_l, leaves_l = PanelTreeEngine._subtree_stats(node.left)
+        score_r, leaves_r = PanelTreeEngine._subtree_stats(node.right)
+        own = node.split_score if node.split_score is not None else 0.0
+        return own + score_l + score_r, leaves_l + leaves_r
+
+    @classmethod
+    def _collapse(cls, node: PanelTreeNode) -> None:
+        """Turn an internal node into a leaf (keeps its already-fitted model)."""
+        node.is_leaf = True
+        node.left = None
+        node.right = None
+        node.split_feature = None
+        node.split_threshold = None
+        node.split_score = None
+        node.feature_ranking = None
+        node._split_feature_idx = None
+
+    @classmethod
+    def _prune_node(cls, node: PanelTreeNode, ccp_alpha: float) -> None:
+        """Bottom-up collapse of subtrees whose gain does not justify their leaves.
+
+        A subtree rooted at *node* is collapsed when its cumulative split-score
+        gain does not exceed ``ccp_alpha * (n_leaves - 1)`` — i.e. its
+        *effective alpha* ``gain / (n_leaves - 1)`` is ``<= ccp_alpha``.
+        Children are pruned first so the decision uses the post-pruning subtree.
+        """
+        if node.is_leaf:
+            return
+        cls._prune_node(node.left, ccp_alpha)
+        cls._prune_node(node.right, ccp_alpha)
+        if node.is_leaf:  # children pruning may have already collapsed us
+            return
+        score, n_leaves = cls._subtree_stats(node)
+        if n_leaves > 1 and score <= ccp_alpha * (n_leaves - 1):
+            cls._collapse(node)
+
+    def prune(self, ccp_alpha: float) -> "PanelTreeEngine":
+        """Post-prune the fitted tree in place via cost-complexity pruning.
+
+        Parameters
+        ----------
+        ccp_alpha : float
+            Complexity penalty per leaf.  ``0`` leaves the tree unchanged;
+            larger values collapse more (weaker) subtrees.  Leaf models are
+            retained (each node was fitted during ``fit``), so ``predict`` keeps
+            working after pruning.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        if ccp_alpha < 0:
+            raise ValueError("ccp_alpha must be non-negative.")
+        if ccp_alpha > 0:
+            self._prune_node(self.root_, ccp_alpha)
+        return self
+
+    def cost_complexity_pruning_path(self) -> Dict[str, np.ndarray]:
+        """Compute the weakest-link cost-complexity pruning path.
+
+        Repeatedly collapses the internal node with the smallest *effective
+        alpha* (``subtree_gain / (n_leaves - 1)``) on a copy of the fitted
+        tree, recording the alpha at which each collapse happens together with
+        the resulting leaf count and total remaining split-score gain.
+
+        Returns
+        -------
+        dict with keys ``ccp_alphas``, ``n_leaves`` and ``total_scores`` (all
+        ``np.ndarray``), ordered by increasing alpha.  ``ccp_alphas[0] == 0``
+        corresponds to the full, unpruned tree.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        root = copy.deepcopy(self.root_)
+
+        total_score, n_leaves = self._subtree_stats(root)
+        alphas = [0.0]
+        leaves_seq = [n_leaves]
+        scores_seq = [total_score]
+
+        while not root.is_leaf:
+            weakest, weakest_alpha = self._find_weakest_link(root)
+            if weakest is None:
+                break
+            self._collapse(weakest)
+            total_score, n_leaves = self._subtree_stats(root)
+            alphas.append(weakest_alpha)
+            leaves_seq.append(n_leaves)
+            scores_seq.append(total_score)
+
+        return {
+            "ccp_alphas": np.asarray(alphas, dtype=float),
+            "n_leaves": np.asarray(leaves_seq, dtype=int),
+            "total_scores": np.asarray(scores_seq, dtype=float),
+        }
+
+    @classmethod
+    def _find_weakest_link(
+        cls, root: PanelTreeNode
+    ) -> Tuple[Optional[PanelTreeNode], float]:
+        """Return the internal node with the smallest effective alpha."""
+        best_node: Optional[PanelTreeNode] = None
+        best_alpha = np.inf
+
+        def _walk(node: PanelTreeNode) -> None:
+            nonlocal best_node, best_alpha
+            if node.is_leaf:
+                return
+            score, n_leaves = cls._subtree_stats(node)
+            if n_leaves > 1:
+                alpha = score / (n_leaves - 1)
+                if alpha < best_alpha:
+                    best_alpha = alpha
+                    best_node = node
+            _walk(node.left)
+            _walk(node.right)
+
+        _walk(root)
+        return best_node, float(best_alpha)
+
+    # ------------------------------------------------------------------
     # Tree construction (recursive)
     # ------------------------------------------------------------------
+
 
     def _next_id(self) -> int:
         nid = self._node_counter
