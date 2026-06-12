@@ -20,7 +20,15 @@ from typing import (
 
 import numpy as np
 import pandas as pd
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
+
+try:  # Optional dependency: real feature-dimension parallelism.
+    from joblib import Parallel, delayed
+
+    _HAS_JOBLIB = True
+except ImportError:  # pragma: no cover - exercised only without joblib
+    _HAS_JOBLIB = False
+
 
 from ptree.node import PanelTreeNode
 from ptree.predictors import (
@@ -90,7 +98,9 @@ class PanelTreeEngine:
         verbose: int = 1,
         predictor_params: Optional[Dict] = None,
         keep_node_stats: bool = False,
+        parallel_backend: str = "threads",
     ):
+
 
         # Predictor template
         if isinstance(predictor, type):
@@ -108,6 +118,8 @@ class PanelTreeEngine:
         self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
         self.verbose = verbose
         self.keep_node_stats = keep_node_stats
+        self.parallel_backend = parallel_backend
+
 
 
         # State populated after fitting
@@ -366,57 +378,70 @@ class PanelTreeEngine:
         else:
             eval_order = list(range(n_features))
 
-        ranking: List[tuple] = []
-        best_score = -np.inf
-        best_split: Optional[Tuple[int, float]] = None
-        early_stopped = False
+        # A2: when parallelism is requested (and joblib is available) and we
+        # are NOT in the inherently-serial early-stopping path, evaluate each
+        # feature's candidate thresholds in parallel.  Results are reduced in
+        # deterministic ``eval_order`` so the chosen split is bit-identical to
+        # the serial path (ties broken by first-seen, matching ``>`` below).
+        use_parallel = (
+            self.n_jobs != 1
+            and _HAS_JOBLIB
+            and not (self.fast_mode and self.early_stopping_threshold is not None)
+        )
 
-        for feat_idx in eval_order:
-            for thr in thresholds:
-                mask_left = X_node[:, feat_idx] < thr
-                n_left = int(mask_left.sum())
-                n_right = len(mask_left) - n_left
-
-                # Skip if either child would be too small
-                if n_left < self.min_samples or n_right < self.min_samples:
-                    continue
-
-                # Fit both child predictors (incremental: compute only the
-                # smaller side's sufficient statistics, derive the larger by
-                # subtracting from the parent's cached statistics).
-                left_metrics, right_metrics = self._fit_and_evaluate_children(
-                    X_node, y_node, w_node, mask_left, parent_node=node,
+        if use_parallel:
+            per_feature = Parallel(
+                n_jobs=self.n_jobs, backend="loky"
+                if self.parallel_backend == "processes"
+                else "threading",
+            )(
+                delayed(self._evaluate_feature)(
+                    feat_idx, X_node, y_node, w_node, thresholds, node
                 )
+                for feat_idx in eval_order
+            )
+            ranking: List[tuple] = []
+            best_score = -np.inf
+            best_split: Optional[Tuple[int, float]] = None
+            for feat_results in per_feature:  # already in eval_order
+                for feat_idx, thr, score in feat_results:
+                    ranking.append((feat_idx, thr, score))
+                    if score > best_score:
+                        best_score = score
+                        best_split = (feat_idx, thr)
+        else:
+            ranking = []
+            best_score = -np.inf
+            best_split = None
 
-                score = self.criterion.calculate_score(left_metrics, right_metrics)
+            for feat_idx in eval_order:
+                feat_results = self._evaluate_feature(
+                    feat_idx, X_node, y_node, w_node, thresholds, node
+                )
+                for fidx, thr, score in feat_results:
+                    ranking.append((fidx, thr, score))
+                    if self.verbose >= 2:
+                        logger.debug(
+                            "  [depth=%d] %s < %.2f  score=%.6f",
+                            depth, self._feature_names[fidx], thr, score,
+                        )
+                    if score > best_score:
+                        best_score = score
+                        best_split = (fidx, thr)
 
-                ranking.append((feat_idx, thr, score))
-
-                if self.verbose >= 2:
-                    logger.debug(
-                        "  [depth=%d] %s < %.2f  score=%.6f  (L:%d R:%d)",
-                        depth, self._feature_names[feat_idx], thr, score,
-                        n_left, n_right,
-                    )
-
-                if score > best_score:
-                    best_score = score
-                    best_split = (feat_idx, thr)
-
-            # Early stopping (fast mode)
-            if (
-                self.fast_mode
-                and self.early_stopping_threshold is not None
-                and best_score >= self.early_stopping_threshold
-                and feat_idx in (eval_order[: max(1, len(eval_order) // 2)])
-            ):
-                early_stopped = True
-                if self.verbose >= 1:
-                    logger.info(
-                        "  [depth=%d] Early stopping: score %.4f >= threshold %.4f",
-                        depth, best_score, self.early_stopping_threshold,
-                    )
-                break
+                # Early stopping (fast mode) — serial path only.
+                if (
+                    self.fast_mode
+                    and self.early_stopping_threshold is not None
+                    and best_score >= self.early_stopping_threshold
+                    and feat_idx in (eval_order[: max(1, len(eval_order) // 2)])
+                ):
+                    if self.verbose >= 1:
+                        logger.info(
+                            "  [depth=%d] Early stopping: score %.4f >= threshold %.4f",
+                            depth, best_score, self.early_stopping_threshold,
+                        )
+                    break
 
         # Sort ranking descending by score
         ranking.sort(key=lambda x: x[2], reverse=True)
@@ -425,6 +450,37 @@ class PanelTreeEngine:
             return None
 
         return (best_split[0], best_split[1], best_score, ranking)
+
+    def _evaluate_feature(
+        self,
+        feat_idx: int,
+        X_node: np.ndarray,
+        y_node: np.ndarray,
+        w_node: Optional[np.ndarray],
+        thresholds: List[float],
+        node: PanelTreeNode,
+    ) -> List[Tuple[int, float, float]]:
+        """Evaluate all candidate thresholds for a single feature.
+
+        Returns a list of ``(feat_idx, threshold, score)`` for thresholds that
+        produce two sufficiently-large children.  Pure w.r.t. engine state, so
+        it can be dispatched to a worker thread/process.
+        """
+        col = X_node[:, feat_idx]
+        results: List[Tuple[int, float, float]] = []
+        for thr in thresholds:
+            mask_left = col < thr
+            n_left = int(mask_left.sum())
+            n_right = mask_left.shape[0] - n_left
+            if n_left < self.min_samples or n_right < self.min_samples:
+                continue
+            left_metrics, right_metrics = self._fit_and_evaluate_children(
+                X_node, y_node, w_node, mask_left, parent_node=node,
+            )
+            score = self.criterion.calculate_score(left_metrics, right_metrics)
+            results.append((feat_idx, thr, score))
+        return results
+
 
     def _fit_and_evaluate_children(
         self,
