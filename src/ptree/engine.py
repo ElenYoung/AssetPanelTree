@@ -9,6 +9,7 @@ import copy
 import logging
 import time
 from typing import (
+    Any,
     Callable,
     Dict,
     List,
@@ -17,6 +18,7 @@ from typing import (
     Type,
     Union,
 )
+
 
 import numpy as np
 import pandas as pd
@@ -41,10 +43,12 @@ from ptree.predictors import (
 from ptree.criteria import (
     CriterionBase,
     R2DiffCriterion,
+    MeanVarianceCriterion,
     ClassificationCriterion,
     evaluate_regression,
     evaluate_classification,
 )
+
 
 logger = logging.getLogger("ptree")
 
@@ -175,11 +179,18 @@ class PanelTreeEngine:
         self._is_classification: bool = isinstance(
             self.criterion, ClassificationCriterion
         )
+        # When the mean-variance criterion is used, each child's metrics must
+        # carry a per-time long-short portfolio return series (``_port_ret``).
+        self._needs_port_ret: bool = isinstance(
+            self.criterion, MeanVarianceCriterion
+        )
         # Store processed data for predictions & cluster retrieval
         self._X: Optional[np.ndarray] = None
         self._y: Optional[np.ndarray] = None
         self._weights: Optional[np.ndarray] = None
+        self._time: Optional[np.ndarray] = None
         self._X_df: Optional[pd.DataFrame] = None
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,6 +202,7 @@ class PanelTreeEngine:
         y: pd.Series,
         feature_names: List[str],
         weights: Optional[np.ndarray] = None,
+        time_index: Optional[Union[np.ndarray, pd.Series, str]] = None,
     ) -> "PanelTreeEngine":
         """Build the Panel Tree.
 
@@ -204,6 +216,12 @@ class PanelTreeEngine:
             Names of the feature columns used for splitting and prediction.
         weights : ndarray or None
             Observation weights (e.g. inverse-volatility).
+        time_index : ndarray, Series, str or None
+            Per-observation time label aligned with *X*.  Required when the
+            criterion is :class:`MeanVarianceCriterion` (used to aggregate each
+            leaf's long-short portfolio into a return time series); ignored by
+            the R²/classification criteria.  A string is interpreted as a
+            column name in *X*.
         """
         self._feature_names = list(feature_names)
         X_arr = X[feature_names].values.astype(np.float64)
@@ -214,6 +232,23 @@ class PanelTreeEngine:
         self._weights = weights.values if isinstance(weights, pd.Series) else weights
         self._X_df = X
         self._node_counter = 0
+
+        # Resolve the optional per-observation time labels (mean-variance
+        # criterion only).  Accept an array/Series or a column name in ``X``.
+        if time_index is None:
+            self._time = None
+        elif isinstance(time_index, str):
+            self._time = X[time_index].values
+        elif isinstance(time_index, pd.Series):
+            self._time = time_index.values
+        else:
+            self._time = np.asarray(time_index)
+        if self._needs_port_ret and self._time is None:
+            raise ValueError(
+                "MeanVarianceCriterion requires `time_index` to be passed to "
+                "fit() so leaf long-short portfolios can be aggregated by time."
+            )
+
 
         all_indices = np.arange(self._total_samples)
 
@@ -282,6 +317,153 @@ class PanelTreeEngine:
     def get_leaf_samples(self) -> Dict[int, np.ndarray]:
         """Map leaf ``node_id`` → original sample indices."""
         return {leaf.node_id: leaf.sample_indices for leaf in self.get_leaves()}
+
+    # ------------------------------------------------------------------
+    # SDF / efficient-frontier aggregation (C3)
+    # ------------------------------------------------------------------
+
+    def build_sdf_factor(
+        self,
+        X: Optional[pd.DataFrame] = None,
+        y: Optional[Union[pd.Series, np.ndarray]] = None,
+        time_index: Optional[Union[np.ndarray, pd.Series, str]] = None,
+        ridge: float = 1e-6,
+    ) -> Dict[str, Any]:
+        """Aggregate the leaf long-short portfolios into a tradeable SDF factor.
+
+        Each leaf forms a per-time long-short portfolio (predicted-return
+        weighted, cross-sectionally de-meaned).  The leaf portfolio return
+        series are then combined by *mean-variance* (tangency) weights
+        ``w ∝ Σ^{-1} μ`` to produce a single stochastic-discount-factor (SDF)
+        return series — the in-sample maximum-Sharpe combination of the tree's
+        regime portfolios, realising the "growing the efficient frontier" goal.
+
+        Parameters
+        ----------
+        X, y, time_index : optional
+            Data to evaluate the leaf portfolios on.  If omitted, the training
+            data passed to ``fit`` is reused (requires that ``fit`` was given a
+            ``time_index``).  When supplied, ``time_index`` may be an array,
+            Series, or a column name in ``X``.
+        ridge : float, default 1e-6
+            Diagonal load added to the leaf covariance for a stable inverse.
+
+        Returns
+        -------
+        dict with keys
+            ``weights`` : ndarray, the tangency weight on each leaf portfolio;
+            ``leaf_ids`` : list[int], leaf node ids aligned with ``weights``;
+            ``times`` : ndarray, the (sorted) common time labels;
+            ``sdf_returns`` : ndarray, the SDF factor return per time;
+            ``sharpe`` : float, in-sample (non-annualised) Sharpe of the SDF.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+
+        # Resolve evaluation data: reuse training data unless new data is given.
+        if X is None:
+            X_arr = self._X
+            y_arr = self._y
+            time_arr = self._time
+        else:
+            X_arr = X[self._feature_names].values.astype(np.float64)
+            if y is None:
+                raise ValueError("`y` must be supplied when `X` is supplied.")
+            y_arr = (
+                y.values.astype(np.float64)
+                if isinstance(y, pd.Series)
+                else np.asarray(y, dtype=np.float64)
+            )
+            if isinstance(time_index, str):
+                time_arr = X[time_index].values
+            elif isinstance(time_index, pd.Series):
+                time_arr = time_index.values
+            elif time_index is not None:
+                time_arr = np.asarray(time_index)
+            else:
+                time_arr = None
+
+        if time_arr is None:
+            raise ValueError(
+                "build_sdf_factor requires time labels: pass `time_index` here "
+                "or to fit()."
+            )
+
+        # Route every observation to its leaf, then build each leaf's per-time
+        # long-short portfolio return series.
+        leaf_ids_full = np.empty(X_arr.shape[0], dtype=int)
+        self._assign_leaf_ids(self.root_, X_arr, np.arange(X_arr.shape[0]), leaf_ids_full)
+
+        leaf_returns: Dict[int, Dict[Any, float]] = {}
+        for leaf in self.get_leaves():
+            mask = leaf_ids_full == leaf.node_id
+            if not mask.any() or leaf.predictor is None:
+                continue
+            y_pred = leaf.predictor.predict(X_arr[mask])
+            leaf_returns[leaf.node_id] = self._portfolio_returns(
+                y_arr[mask], y_pred, time_arr[mask]
+            )
+
+        leaf_ids = [lid for lid, r in leaf_returns.items() if r]
+        if not leaf_ids:
+            raise ValueError("No leaf produced a non-empty portfolio series.")
+
+        # Align leaf portfolio series on their common set of time periods.
+        common = sorted(
+            set.intersection(*(set(leaf_returns[lid]) for lid in leaf_ids))
+        )
+        if len(common) < 2:
+            raise ValueError(
+                "Leaf portfolios share fewer than 2 common periods; cannot "
+                "estimate a mean-variance combination."
+            )
+
+        R = np.array(
+            [[leaf_returns[lid][t] for lid in leaf_ids] for t in common],
+            dtype=np.float64,
+        )
+        mu = R.mean(axis=0)
+        Sigma = np.cov(R, rowvar=False)
+        Sigma = np.atleast_2d(Sigma) + ridge * np.eye(len(leaf_ids))
+        try:
+            w = np.linalg.solve(Sigma, mu)
+        except np.linalg.LinAlgError:
+            w = np.linalg.lstsq(Sigma, mu, rcond=None)[0]
+        norm = np.abs(w).sum()
+        if norm > 0:
+            w = w / norm
+
+        sdf_returns = R @ w
+        sd = float(sdf_returns.std())
+        sharpe = float(sdf_returns.mean() / sd) if sd > 1e-12 else 0.0
+
+        return {
+            "weights": w,
+            "leaf_ids": leaf_ids,
+            "times": np.asarray(common),
+            "sdf_returns": sdf_returns,
+            "sharpe": sharpe,
+        }
+
+    def _assign_leaf_ids(
+        self,
+        node: PanelTreeNode,
+        X_arr: np.ndarray,
+        row_indices: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        """Recursively record, for each row, the id of the leaf it falls into."""
+        if node.is_leaf:
+            out[row_indices] = node.node_id
+            return
+        feat_idx = node._split_feature_idx
+        if feat_idx is None:
+            feat_idx = self._feature_names.index(node.split_feature)
+        mask_left = X_arr[row_indices, feat_idx] < node.split_threshold
+        if node.left is not None:
+            self._assign_leaf_ids(node.left, X_arr, row_indices[mask_left], out)
+        if node.right is not None:
+            self._assign_leaf_ids(node.right, X_arr, row_indices[~mask_left], out)
+
 
     # ------------------------------------------------------------------
     # Cost-complexity pruning (B3, post-fit)
@@ -447,6 +629,7 @@ class PanelTreeEngine:
         X_node = self._X[indices]
         y_node = self._y[indices]
         w_node = self._weights[indices] if self._weights is not None else None
+        time_node = self._time[indices] if self._time is not None else None
 
         predictor = self._make_predictor()
         if self.honest and not self.honest_refit_full:
@@ -460,7 +643,8 @@ class PanelTreeEngine:
         else:
             predictor.fit(X_node, y_node, weights=w_node)
         node.predictor = predictor
-        node.metrics = self._evaluate(X_node, y_node, predictor, w_node)
+        node.metrics = self._evaluate(X_node, y_node, predictor, w_node, time_node)
+
 
 
         # Compute and cache sufficient statistics (for Ridge incremental updates)
@@ -487,12 +671,14 @@ class PanelTreeEngine:
         # splitting.  It bypasses the A1 incremental optimisation by design.
         if self.honest:
             best = self._find_best_split_honest(
-                X_node, y_node, w_node, depth,
+                X_node, y_node, w_node, depth, time_node,
             )
         else:
             best = self._find_best_split(
                 indices, X_node, y_node, w_node, depth, parent_ranking, node,
+                time_node,
             )
+
 
 
         if best is None:
@@ -561,8 +747,10 @@ class PanelTreeEngine:
         depth: int,
         parent_ranking: Optional[List[tuple]],
         node: PanelTreeNode,
+        time_node: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[int, float, float, List[tuple]]]:
         """Search all (feature, threshold) combinations and return the best.
+
 
         Returns ``None`` if no valid split is found.
 
@@ -604,9 +792,10 @@ class PanelTreeEngine:
                 else "threading",
             )(
                 delayed(self._evaluate_feature)(
-                    feat_idx, X_node, y_node, w_node, thresholds, node
+                    feat_idx, X_node, y_node, w_node, thresholds, node, time_node
                 )
                 for feat_idx in eval_order
+
             )
             ranking: List[tuple] = []
             best_score = -np.inf
@@ -624,8 +813,9 @@ class PanelTreeEngine:
 
             for feat_idx in eval_order:
                 feat_results = self._evaluate_feature(
-                    feat_idx, X_node, y_node, w_node, thresholds, node
+                    feat_idx, X_node, y_node, w_node, thresholds, node, time_node
                 )
+
                 for fidx, thr, score in feat_results:
                     ranking.append((fidx, thr, score))
                     if self.verbose >= 2:
@@ -665,8 +855,10 @@ class PanelTreeEngine:
         y_node: np.ndarray,
         w_node: Optional[np.ndarray],
         depth: int,
+        time_node: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[int, float, float, List[tuple]]]:
         """Honest split search (B2).
+
 
         The node sample is split once into a *fit* subset and a disjoint *eval*
         subset (``honest_frac`` controls the fit fraction).  For every candidate
@@ -691,6 +883,8 @@ class PanelTreeEngine:
         X_eval, y_eval = X_node[eval_idx], y_node[eval_idx]
         w_fit = w_node[fit_idx] if w_node is not None else None
         w_eval = w_node[eval_idx] if w_node is not None else None
+        t_eval = time_node[eval_idx] if time_node is not None else None
+
 
         n_features = X_node.shape[1]
         ranking: List[tuple] = []
@@ -734,11 +928,14 @@ class PanelTreeEngine:
                 left_metrics = self._evaluate(
                     X_eval[eval_left], y_eval[eval_left], left_pred,
                     None if w_eval is None else w_eval[eval_left],
+                    None if t_eval is None else t_eval[eval_left],
                 )
                 right_metrics = self._evaluate(
                     X_eval[~eval_left], y_eval[~eval_left], right_pred,
                     None if w_eval is None else w_eval[~eval_left],
+                    None if t_eval is None else t_eval[~eval_left],
                 )
+
                 score = self.criterion.calculate_score(left_metrics, right_metrics)
                 ranking.append((feat_idx, thr, score))
                 if score > best_score:
@@ -759,6 +956,7 @@ class PanelTreeEngine:
         w_node: Optional[np.ndarray],
         thresholds: List[float],
         node: PanelTreeNode,
+        time_node: Optional[np.ndarray] = None,
     ) -> List[Tuple[int, float, float]]:
         """Evaluate all candidate thresholds for a single feature.
 
@@ -784,7 +982,9 @@ class PanelTreeEngine:
                 continue
             left_metrics, right_metrics = self._fit_and_evaluate_children(
                 X_node, y_node, w_node, mask_left, parent_node=node,
+                time_node=time_node,
             )
+
             score = self.criterion.calculate_score(left_metrics, right_metrics)
             results.append((feat_idx, thr, score))
         return results
@@ -797,8 +997,10 @@ class PanelTreeEngine:
         w_node: Optional[np.ndarray],
         mask_left: np.ndarray,
         parent_node: PanelTreeNode,
+        time_node: Optional[np.ndarray] = None,
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Fit *both* child predictors for one candidate split and evaluate.
+
 
         Incremental optimisation (A1): when the parent node has cached Ridge
         sufficient statistics, only the *smaller* child's ``XtWX`` / ``XtWy``
@@ -815,6 +1017,9 @@ class PanelTreeEngine:
         X_right, y_right = X_node[mask_right], y_node[mask_right]
         w_left = w_node[mask_left] if w_node is not None else None
         w_right = w_node[mask_right] if w_node is not None else None
+        t_left = time_node[mask_left] if time_node is not None else None
+        t_right = time_node[mask_right] if time_node is not None else None
+
 
         left_predictor = self._make_predictor()
         right_predictor = self._make_predictor()
@@ -870,9 +1075,12 @@ class PanelTreeEngine:
             left_predictor.fit(X_left, y_left, weights=w_left)
             right_predictor.fit(X_right, y_right, weights=w_right)
 
-        left_metrics = self._evaluate(X_left, y_left, left_predictor, w_left)
-        right_metrics = self._evaluate(X_right, y_right, right_predictor, w_right)
+        left_metrics = self._evaluate(X_left, y_left, left_predictor, w_left, t_left)
+        right_metrics = self._evaluate(
+            X_right, y_right, right_predictor, w_right, t_right
+        )
         return left_metrics, right_metrics
+
 
 
     # ------------------------------------------------------------------
@@ -885,6 +1093,7 @@ class PanelTreeEngine:
         y: np.ndarray,
         predictor: PredictorBase,
         weights: Optional[np.ndarray],
+        time: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         if self._is_classification:
             if hasattr(predictor, "predict_proba"):
@@ -895,7 +1104,50 @@ class PanelTreeEngine:
         else:
             y_pred = predictor.predict(X)
             metrics = evaluate_regression(y, y_pred, weights)
+            # C3/B1: attach the per-time long-short portfolio return series so
+            # the mean-variance criterion can evaluate the efficient-frontier
+            # contribution of this (candidate) leaf.
+            if self._needs_port_ret and time is not None:
+                metrics["_port_ret"] = self._portfolio_returns(y, y_pred, time)
         return metrics
+
+    @staticmethod
+    def _portfolio_returns(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        time: np.ndarray,
+    ) -> Dict[Any, float]:
+        """Aggregate a leaf into a per-time long-short portfolio return.
+
+        Within each time period the predicted returns are cross-sectionally
+        de-meaned to form dollar-neutral long-short weights ``w_i = yhat_i -
+        mean(yhat)``; the period's portfolio return is the weight-normalised
+        realised return ``sum(w_i * y_i) / sum(|w_i|)``.  Periods with a single
+        observation or zero net weight contribute ``0``.
+
+        Returns
+        -------
+        dict mapping each time label to its portfolio return.
+        """
+        y_true = np.asarray(y_true, dtype=np.float64)
+        y_pred = np.asarray(y_pred, dtype=np.float64)
+        time = np.asarray(time)
+        out: Dict[Any, float] = {}
+        # Group by time label.  ``np.unique`` keeps this O(n log n).
+        uniq = np.unique(time)
+        for t in uniq:
+            mask = time == t
+            if mask.sum() < 2:
+                continue
+            w = y_pred[mask] - y_pred[mask].mean()
+            denom = np.abs(w).sum()
+            if denom <= 1e-12:
+                continue
+            out[t.item() if hasattr(t, "item") else t] = float(
+                (w * y_true[mask]).sum() / denom
+            )
+        return out
+
 
     # ------------------------------------------------------------------
     # Prediction (recursive)

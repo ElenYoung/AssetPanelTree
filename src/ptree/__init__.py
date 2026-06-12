@@ -46,8 +46,10 @@ from ptree.criteria import (
     CriterionBase,
     R2DiffCriterion,
     WeightedR2DiffCriterion,
+    MeanVarianceCriterion,
     ClassificationCriterion,
 )
+
 
 from ptree.node import PanelTreeNode
 from ptree.engine import PanelTreeEngine
@@ -72,7 +74,9 @@ __all__ = [
     "CriterionBase",
     "R2DiffCriterion",
     "WeightedR2DiffCriterion",
+    "MeanVarianceCriterion",
     "ClassificationCriterion",
+
 
     # Core classes
     "PanelTreeNode",

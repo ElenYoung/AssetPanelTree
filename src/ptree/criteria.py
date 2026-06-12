@@ -176,8 +176,98 @@ class WeightedR2DiffCriterion(CriterionBase):
 
 
 # ======================================================================
+# Regression: Mean-Variance / SDF Sharpe increment
+# ======================================================================
+
+class MeanVarianceCriterion(CriterionBase):
+    """Split quality = tangency Sharpe of the two child long-short portfolios.
+
+    Aligns the split objective with the academic Panel Tree goal of *growing
+    the efficient frontier*: instead of comparing single-node R², each child
+    leaf forms a cross-sectionally de-meaned, predicted-return-weighted
+    long-short portfolio, producing a return *time series*.  The split score is
+    the in-sample tangency (maximum) Sharpe ratio obtainable by mean-variance
+    combining the left and right portfolio series,
+
+    .. math::
+        \\text{score} = \\sqrt{\\mu^\\top \\Sigma^{-1} \\mu}\\,\\sqrt{A},
+
+    where :math:`\\mu, \\Sigma` are the mean vector / covariance of the two
+    child portfolio returns and :math:`A` is the annualisation factor.  A high
+    score means the two children span *complementary* predictability and thus
+    push the efficient frontier out further than either alone.
+
+    Unlike the R²-based criteria this requires the engine to attach a per-time
+    portfolio return series to each child's metrics under the non-scalar key
+    ``"_port_ret"`` (the engine does this automatically when this criterion is
+    used and a ``time_index`` is supplied to ``fit``).
+
+    Parameters
+    ----------
+    annualization : float, default 12.0
+        Periods per year used to annualise the Sharpe ratio (e.g. 12 monthly,
+        252 daily).  Only rescales the score monotonically.
+    ridge : float, default 1e-6
+        Diagonal load added to the 2x2 covariance for numerical stability.
+    min_periods : int, default 3
+        Minimum number of overlapping time periods required; below this the
+        split scores ``0`` (insufficient data to estimate a Sharpe).
+    """
+
+    def __init__(
+        self,
+        annualization: float = 12.0,
+        ridge: float = 1e-6,
+        min_periods: int = 3,
+    ):
+        self.annualization = annualization
+        self.ridge = ridge
+        self.min_periods = min_periods
+
+    def calculate_score(
+        self,
+        left_metrics: Dict[str, float],
+        right_metrics: Dict[str, float],
+    ) -> float:
+        rl = left_metrics.get("_port_ret")
+        rr = right_metrics.get("_port_ret")
+        if not rl or not rr:
+            return 0.0
+
+        common = sorted(set(rl).intersection(rr))
+        if len(common) < self.min_periods:
+            return 0.0
+
+        R = np.array([[rl[t], rr[t]] for t in common], dtype=np.float64)
+        mu = R.mean(axis=0)
+        # ``np.cov`` needs >=2 observations; guarded by ``min_periods``.
+        Sigma = np.cov(R, rowvar=False)
+        Sigma = np.atleast_2d(Sigma) + self.ridge * np.eye(2)
+        try:
+            inv = np.linalg.inv(Sigma)
+        except np.linalg.LinAlgError:
+            return 0.0
+        sr_sq = float(mu @ inv @ mu)
+        if sr_sq <= 0.0:
+            return 0.0
+        return float(np.sqrt(sr_sq) * np.sqrt(self.annualization))
+
+    def metric_key(self) -> str:
+        # Reuse ``r2`` for node-level logging/reporting; the criterion itself
+        # operates on the non-scalar ``_port_ret`` series.
+        return "r2"
+
+    def __repr__(self) -> str:
+        return (
+            f"MeanVarianceCriterion(annualization={self.annualization}, "
+            f"ridge={self.ridge}, min_periods={self.min_periods})"
+        )
+
+
+# ======================================================================
 # Classification: Precision / F1 / AUC difference
 # ======================================================================
+
 
 
 class ClassificationCriterion(CriterionBase):
