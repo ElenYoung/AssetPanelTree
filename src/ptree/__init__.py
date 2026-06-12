@@ -53,7 +53,9 @@ from ptree.criteria import (
 
 from ptree.node import PanelTreeNode
 from ptree.engine import PanelTreeEngine
+from ptree.ensemble import PanelForest
 from ptree.visualization import MosaicVisualizer, NodeReporter
+
 
 __all__ = [
     # Version info
@@ -81,7 +83,10 @@ __all__ = [
     # Core classes
     "PanelTreeNode",
     "PanelTreeEngine",
+    # Ensembles
+    "PanelForest",
     # Visualization
+
     "MosaicVisualizer",
     "NodeReporter",
 ]

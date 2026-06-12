@@ -120,7 +120,9 @@ class PanelTreeEngine:
         predictor_params: Optional[Dict] = None,
         keep_node_stats: bool = False,
         parallel_backend: str = "threads",
+        max_features: Optional[Union[str, int, float]] = None,
     ):
+
 
 
 
@@ -156,6 +158,12 @@ class PanelTreeEngine:
         self.verbose = verbose
         self.keep_node_stats = keep_node_stats
         self.parallel_backend = parallel_backend
+        # D1/P-Forest: node-level random feature subsetting.  ``None`` (default)
+        # evaluates every feature (standard P-Tree); ``"sqrt"`` / ``"log2"`` /
+        # an int / a float fraction restrict each node's search to a random
+        # subset drawn from ``self._rng``, decorrelating trees in an ensemble.
+        self.max_features = max_features
+
 
         # B2: honest split — separate the samples used to *choose* a split from
         # those used to *evaluate* its quality, removing the in-sample
@@ -774,6 +782,17 @@ class PanelTreeEngine:
         else:
             eval_order = list(range(n_features))
 
+        # D1/P-Forest: restrict the search to a random feature subset at this
+        # node (decorrelates trees in an ensemble).  ``None`` keeps all
+        # features (standard P-Tree).  The subset is drawn from ``self._rng``
+        # so it is reproducible given ``random_state``.
+        if self.max_features is not None:
+            k = self._resolve_max_features(n_features)
+            if k < n_features:
+                chosen = self._rng.choice(eval_order, size=k, replace=False)
+                eval_order = list(chosen)
+
+
         # A2: when parallelism is requested (and joblib is available) and we
         # are NOT in the inherently-serial early-stopping path, evaluate each
         # feature's candidate thresholds in parallel.  Results are reduced in
@@ -1187,6 +1206,35 @@ class PanelTreeEngine:
     def _make_predictor(self) -> PredictorBase:
         """Create a fresh copy of the predictor template."""
         return copy.deepcopy(self._predictor_template)
+
+    def _resolve_max_features(self, n_features: int) -> int:
+        """Resolve ``self.max_features`` to a concrete feature count (D1).
+
+        Mirrors the scikit-learn convention used by random forests:
+
+        * ``"sqrt"``  → ``max(1, floor(sqrt(p)))``
+        * ``"log2"``  → ``max(1, floor(log2(p)))``
+        * ``int``     → ``min(value, p)`` (absolute count)
+        * ``float``   → ``max(1, floor(fraction * p))`` (fraction of features)
+        * otherwise   → ``p`` (all features)
+        """
+        mf = self.max_features
+        if mf is None:
+            return n_features
+        if isinstance(mf, str):
+            if mf == "sqrt":
+                return max(1, int(np.sqrt(n_features)))
+            if mf == "log2":
+                return max(1, int(np.log2(n_features)))
+            raise ValueError(
+                f"Unknown max_features string {mf!r}; expected 'sqrt' or 'log2'."
+            )
+        if isinstance(mf, (int, np.integer)) and not isinstance(mf, bool):
+            return max(1, min(int(mf), n_features))
+        if isinstance(mf, float):
+            return max(1, min(int(mf * n_features), n_features))
+        return n_features
+
 
     @staticmethod
     def _collect_leaves(node: PanelTreeNode, acc: List[PanelTreeNode]) -> None:
