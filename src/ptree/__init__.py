@@ -53,7 +53,8 @@ from ptree.criteria import (
 
 from ptree.node import PanelTreeNode
 from ptree.engine import PanelTreeEngine
-from ptree.ensemble import PanelForest
+from ptree.ensemble import PanelForest, BoostedPanelTree
+
 from ptree.visualization import MosaicVisualizer, NodeReporter
 
 
@@ -85,7 +86,9 @@ __all__ = [
     "PanelTreeEngine",
     # Ensembles
     "PanelForest",
+    "BoostedPanelTree",
     # Visualization
+
 
     "MosaicVisualizer",
     "NodeReporter",

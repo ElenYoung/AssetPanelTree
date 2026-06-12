@@ -121,7 +121,10 @@ class PanelTreeEngine:
         keep_node_stats: bool = False,
         parallel_backend: str = "threads",
         max_features: Optional[Union[str, int, float]] = None,
+        splitter: str = "best",
+        n_random_splits: int = 1,
     ):
+
 
 
 
@@ -163,6 +166,21 @@ class PanelTreeEngine:
         # an int / a float fraction restrict each node's search to a random
         # subset drawn from ``self._rng``, decorrelating trees in an ensemble.
         self.max_features = max_features
+        # D3/Extra-Trees: ``splitter="random"`` replaces the exhaustive
+        # ``split_thresholds`` sweep with ``n_random_splits`` random thresholds
+        # drawn (per feature, per node) from the feature's in-node value range —
+        # extra variance reduction + speed for ensembles.  ``"best"`` (default)
+        # keeps the standard exhaustive search and so is fully backward
+        # compatible (the golden baseline path is untouched).
+        if splitter not in {"best", "random"}:
+            raise ValueError(
+                f"splitter must be 'best' or 'random', got {splitter!r}."
+            )
+        self.splitter = splitter
+        if n_random_splits < 1:
+            raise ValueError("n_random_splits must be >= 1.")
+        self.n_random_splits = n_random_splits
+
 
 
         # B2: honest split — separate the samples used to *choose* a split from
@@ -988,10 +1006,23 @@ class PanelTreeEngine:
         (``adaptive_quantiles``), de-duplicated to avoid redundant work.
         """
         col = X_node[:, feat_idx]
-        if thresholds is None:
+        if self.splitter == "random":
+            # D3/Extra-Trees: draw ``n_random_splits`` random thresholds from
+            # this feature's in-node value range instead of the exhaustive
+            # ``split_thresholds`` sweep.  A degenerate (constant) column yields
+            # no valid split.
+            lo = float(col.min())
+            hi = float(col.max())
+            if hi <= lo:
+                return []
+            thresholds = [
+                float(t) for t in self._rng.uniform(lo, hi, size=self.n_random_splits)
+            ]
+        elif thresholds is None:
             qs = np.quantile(col, self.adaptive_quantiles)
             thresholds = sorted(set(float(q) for q in qs))
         results: List[Tuple[int, float, float]] = []
+
         for thr in thresholds:
 
             mask_left = col < thr

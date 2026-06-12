@@ -423,3 +423,235 @@ class PanelForest:
             f"max_features={self.max_features!r}, block_size={self.block_size}, "
             f"aggregate={self.aggregate!r})"
         )
+
+
+class BoostedPanelTree:
+    """Gradient-boosted Panel Trees (P-Boost, D2).
+
+    P-Boost does **not** boost the ``|R^2_L - R^2_R|`` *criterion* (which is not
+    an additive loss); instead it boosts the *target / residual*.  Each round
+    strips the predictability already explained by the running ensemble and
+    re-grows a fresh P-Tree on the residual, so successive trees uncover the
+    *next, weaker* predictability regime that the greedy single tree would have
+    masked::
+
+        F_0(x) = 0
+        for m = 1..M:
+            r   = y - nu * F_{m-1}(x)          # residual (nu = learning_rate)
+            T_m = PanelTreeEngine(R2Diff).fit(X, r)
+            F_m(x) = F_{m-1}(x) + nu * T_m.predict(x)
+
+    Each tree's split criterion stays ``R2Diff`` — only the *fit target*
+    changes.  On single-feature-dominated data the method is **self-limiting**:
+    once the first tree explains the dominant regime, the residual is near-noise
+    and later trees add almost nothing (see :attr:`residual_norms_`).
+
+    Parameters
+    ----------
+    n_estimators : int, default 50
+        Number of boosting rounds (trees).
+    learning_rate : float, default 0.1
+        Shrinkage ``nu`` applied to each tree's contribution.
+    max_depth : int, default 2
+        Depth of each (weak-learner) P-Tree.  Boosting favours shallow trees.
+    subsample : float, default 1.0
+        Fraction of *time blocks* used to fit each tree (stochastic boosting).
+        ``1.0`` uses all data every round.
+    block_size : int, default 5
+        Consecutive time periods per subsample block (only used when
+        ``subsample < 1``).
+    criterion : CriterionBase or None
+        Split criterion for every tree (defaults to :class:`R2DiffCriterion`).
+    base_params : dict or None
+        Extra keyword arguments forwarded to each :class:`PanelTreeEngine`
+        (e.g. ``predictor``, ``min_samples``).  ``max_depth`` / ``criterion``
+        are controlled by the dedicated parameters above.
+    random_state : int or None
+        Seed for the (optional) subsampling.
+    verbose : int, default 0
+        Verbosity passed through to each tree.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 50,
+        learning_rate: float = 0.1,
+        max_depth: int = 2,
+        subsample: float = 1.0,
+        block_size: int = 5,
+        criterion: Optional[Any] = None,
+        base_params: Optional[Dict[str, Any]] = None,
+        random_state: Optional[int] = None,
+        verbose: int = 0,
+    ):
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be >= 1.")
+        if not (0.0 < learning_rate <= 1.0):
+            raise ValueError("learning_rate must lie in (0, 1].")
+        if not (0.0 < subsample <= 1.0):
+            raise ValueError("subsample must lie in (0, 1].")
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1.")
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.subsample = subsample
+        self.block_size = block_size
+        self.criterion = criterion
+        self.base_params = base_params or {}
+        self.random_state = random_state
+        self.verbose = verbose
+
+        # Populated after fit.
+        self.trees_: List[PanelTreeEngine] = []
+        self.residual_norms_: List[float] = []
+        self._feature_names: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        feature_names: List[str],
+        weights: Optional[Union[np.ndarray, pd.Series]] = None,
+        time_index: Optional[Union[np.ndarray, pd.Series, str]] = None,
+    ) -> "BoostedPanelTree":
+        """Fit the boosting sequence.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Processed panel features.
+        y : Series
+            Target aligned with *X*.
+        feature_names : list of str
+            Feature columns used for splitting / prediction.
+        weights : ndarray, Series or None
+            Observation weights (e.g. inverse-volatility).
+        time_index : ndarray, Series, str or None
+            Per-observation time label.  Required only when ``subsample < 1``
+            (the block subsample operates on it).  A string is read as a column
+            of *X*.
+        """
+        X = X.reset_index(drop=True)
+        y = y.reset_index(drop=True)
+        self._feature_names = list(feature_names)
+        y_arr = y.values.astype(np.float64)
+        n = len(y_arr)
+
+        w_arr = weights.values if isinstance(weights, pd.Series) else weights
+
+        if isinstance(time_index, str):
+            time_arr = X[time_index].values
+        elif isinstance(time_index, pd.Series):
+            time_arr = time_index.values
+        elif time_index is not None:
+            time_arr = np.asarray(time_index)
+        else:
+            time_arr = None
+        if self.subsample < 1.0 and time_arr is None:
+            raise ValueError(
+                "BoostedPanelTree requires `time_index` when subsample < 1 "
+                "(the stochastic subsample operates on time blocks)."
+            )
+
+        nu = self.learning_rate
+        rng = np.random.default_rng(self.random_state)
+
+        F = np.zeros(n, dtype=np.float64)  # running ensemble prediction
+        self.trees_ = []
+        self.residual_norms_ = []
+
+        for m in range(self.n_estimators):
+            residual = y_arr - nu * F
+            self.residual_norms_.append(float(np.sqrt(np.sum(residual ** 2))))
+
+            rows = self._subsample_rows(time_arr, n, rng)
+
+            params = dict(self.base_params)
+            params["max_depth"] = self.max_depth
+            params["criterion"] = (
+                self.criterion if self.criterion is not None else R2DiffCriterion()
+            )
+            params.setdefault("predictor", RidgeRegressor(alpha=1.0))
+            params.setdefault("verbose", 0)
+            params["random_state"] = int(rng.integers(0, 2**31 - 1))
+
+            tree = PanelTreeEngine(**params)
+            X_tr = X.iloc[rows].reset_index(drop=True)
+            r_tr = pd.Series(residual[rows], name="residual")
+            w_tr = None if w_arr is None else w_arr[rows]
+            tree.fit(X_tr, r_tr, feature_names=self._feature_names, weights=w_tr)
+
+            # Update the running ensemble on the *full* sample.
+            F = F + tree.predict(X)
+            self.trees_.append(tree)
+
+        # Final residual norm (after the last tree).
+        final_resid = y_arr - nu * F
+        self.residual_norms_.append(float(np.sqrt(np.sum(final_resid ** 2))))
+
+        if self.verbose >= 1:
+            logger.info(
+                "BoostedPanelTree fitted: %d trees, residual %.4f -> %.4f",
+                self.n_estimators,
+                self.residual_norms_[0],
+                self.residual_norms_[-1],
+            )
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Return ``nu * sum_m T_m.predict(X)`` — the boosted prediction."""
+        assert self.trees_, "Call .fit() first."
+        X = X.reset_index(drop=True)
+        F = np.zeros(len(X), dtype=np.float64)
+        for tree in self.trees_:
+            F += tree.predict(X)
+        return self.learning_rate * F
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _subsample_rows(
+        self,
+        time_arr: Optional[np.ndarray],
+        n: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Pick the training rows for one boosting round.
+
+        With ``subsample == 1`` (or no time labels) every row is used.
+        Otherwise a random ``subsample`` fraction of contiguous time blocks is
+        selected (stochastic boosting that respects the panel's time structure).
+        """
+        if self.subsample >= 1.0 or time_arr is None:
+            return np.arange(n)
+        unique_times = np.unique(time_arr)
+        n_times = len(unique_times)
+        blocks = [
+            unique_times[i : i + self.block_size]
+            for i in range(0, n_times, self.block_size)
+        ]
+        n_blocks = len(blocks)
+        k = max(1, int(round(self.subsample * n_blocks)))
+        chosen = rng.choice(n_blocks, size=k, replace=False)
+        keep_times = set()
+        for b in chosen:
+            for t in blocks[b]:
+                keep_times.add(t.item() if hasattr(t, "item") else t)
+        mask = np.array(
+            [(t.item() if hasattr(t, "item") else t) in keep_times for t in time_arr]
+        )
+        return np.flatnonzero(mask)
+
+    def __repr__(self) -> str:
+        return (
+            f"BoostedPanelTree(n_estimators={self.n_estimators}, "
+            f"learning_rate={self.learning_rate}, max_depth={self.max_depth}, "
+            f"subsample={self.subsample})"
+        )
+
