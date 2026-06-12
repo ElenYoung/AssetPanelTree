@@ -105,6 +105,10 @@ class PanelTreeEngine:
         min_samples: int = 100,
         min_impurity_decrease: float = 0.0,
         adaptive_quantiles: Optional[List[float]] = None,
+        honest: bool = False,
+        honest_frac: float = 0.5,
+        honest_refit_full: bool = True,
+        random_state: Optional[int] = None,
         fast_mode: bool = False,
         early_stopping_threshold: Optional[float] = None,
         n_jobs: int = 1,
@@ -113,6 +117,7 @@ class PanelTreeEngine:
         keep_node_stats: bool = False,
         parallel_backend: str = "threads",
     ):
+
 
 
         # Predictor template
@@ -148,9 +153,21 @@ class PanelTreeEngine:
         self.keep_node_stats = keep_node_stats
         self.parallel_backend = parallel_backend
 
+        # B2: honest split — separate the samples used to *choose* a split from
+        # those used to *evaluate* its quality, removing the in-sample
+        # selection bias of greedy panel splitting.
+        self.honest = honest
+        if not (0.0 < honest_frac < 1.0):
+            raise ValueError("honest_frac must lie strictly between 0 and 1.")
+        self.honest_frac = honest_frac
+        self.honest_refit_full = honest_refit_full
+        self.random_state = random_state
+        self._rng = np.random.default_rng(random_state)
+
 
 
         # State populated after fitting
+
         self.root_: Optional[PanelTreeNode] = None
         self._node_counter: int = 0
         self._total_samples: int = 0
@@ -432,9 +449,19 @@ class PanelTreeEngine:
         w_node = self._weights[indices] if self._weights is not None else None
 
         predictor = self._make_predictor()
-        predictor.fit(X_node, y_node, weights=w_node)
+        if self.honest and not self.honest_refit_full:
+            # Honest leaves fit their model on a fit-subset only (no full-sample
+            # refit), keeping the leaf model strictly out-of-evaluation-sample.
+            n = X_node.shape[0]
+            n_fit = min(max(int(round(self.honest_frac * n)), 1), max(n - 1, 1))
+            fit_sel = self._rng.permutation(n)[:n_fit]
+            w_fit = None if w_node is None else w_node[fit_sel]
+            predictor.fit(X_node[fit_sel], y_node[fit_sel], weights=w_fit)
+        else:
+            predictor.fit(X_node, y_node, weights=w_node)
         node.predictor = predictor
         node.metrics = self._evaluate(X_node, y_node, predictor, w_node)
+
 
         # Compute and cache sufficient statistics (for Ridge incremental updates)
         if isinstance(predictor, (RidgeRegressor, VolWeightedRidgeRegressor)):
@@ -454,10 +481,19 @@ class PanelTreeEngine:
             node.elapsed_time = time.time() - t0
             return node
 
-        # Search for the best split
-        best = self._find_best_split(
-            indices, X_node, y_node, w_node, depth, parent_ranking, node,
-        )
+        # Search for the best split.  Honest mode (B2) uses a dedicated path
+        # that fits children on a *fit* subset and scores them on a disjoint
+        # *eval* subset, removing the in-sample selection bias of greedy panel
+        # splitting.  It bypasses the A1 incremental optimisation by design.
+        if self.honest:
+            best = self._find_best_split_honest(
+                X_node, y_node, w_node, depth,
+            )
+        else:
+            best = self._find_best_split(
+                indices, X_node, y_node, w_node, depth, parent_ranking, node,
+            )
+
 
         if best is None:
             node.is_leaf = True
@@ -623,7 +659,99 @@ class PanelTreeEngine:
 
         return (best_split[0], best_split[1], best_score, ranking)
 
+    def _find_best_split_honest(
+        self,
+        X_node: np.ndarray,
+        y_node: np.ndarray,
+        w_node: Optional[np.ndarray],
+        depth: int,
+    ) -> Optional[Tuple[int, float, float, List[tuple]]]:
+        """Honest split search (B2).
+
+        The node sample is split once into a *fit* subset and a disjoint *eval*
+        subset (``honest_frac`` controls the fit fraction).  For every candidate
+        ``(feature, threshold)`` the left/right predictors are fitted on the fit
+        subset, then scored on the eval subset.  Because the samples used to
+        *choose* the split differ from those used to *evaluate* it, the reported
+        ``|R^2_L - R^2_R|`` is free of the in-sample selection bias of the greedy
+        path.  Incremental matrix updates are intentionally not used here.
+
+        The candidate threshold validity check (``min_samples``) is applied on
+        both the fit and eval subsets so neither side becomes degenerate.
+        """
+        n = X_node.shape[0]
+        n_fit = int(round(self.honest_frac * n))
+        # Guard against degenerate fit/eval partitions.
+        n_fit = min(max(n_fit, 1), n - 1)
+        perm = self._rng.permutation(n)
+        fit_idx = perm[:n_fit]
+        eval_idx = perm[n_fit:]
+
+        X_fit, y_fit = X_node[fit_idx], y_node[fit_idx]
+        X_eval, y_eval = X_node[eval_idx], y_node[eval_idx]
+        w_fit = w_node[fit_idx] if w_node is not None else None
+        w_eval = w_node[eval_idx] if w_node is not None else None
+
+        n_features = X_node.shape[1]
+        ranking: List[tuple] = []
+        best_score = -np.inf
+        best_split: Optional[Tuple[int, float]] = None
+
+        for feat_idx in range(n_features):
+            col_fit = X_fit[:, feat_idx]
+            col_eval = X_eval[:, feat_idx]
+            if self.adaptive_thresholds:
+                qs = np.quantile(X_node[:, feat_idx], self.adaptive_quantiles)
+                thresholds = sorted(set(float(q) for q in qs))
+            else:
+                thresholds = self.split_thresholds
+
+            for thr in thresholds:
+                fit_left = col_fit < thr
+                eval_left = col_eval < thr
+                n_fit_l = int(fit_left.sum())
+                n_fit_r = fit_left.shape[0] - n_fit_l
+                n_eval_l = int(eval_left.sum())
+                n_eval_r = eval_left.shape[0] - n_eval_l
+                # Require both fit and eval children to be non-degenerate.
+                if min(n_fit_l, n_fit_r) < self.min_samples:
+                    continue
+                if n_eval_l == 0 or n_eval_r == 0:
+                    continue
+
+                left_pred = self._make_predictor()
+                right_pred = self._make_predictor()
+                left_pred.fit(
+                    X_fit[fit_left], y_fit[fit_left],
+                    weights=None if w_fit is None else w_fit[fit_left],
+                )
+                right_pred.fit(
+                    X_fit[~fit_left], y_fit[~fit_left],
+                    weights=None if w_fit is None else w_fit[~fit_left],
+                )
+
+                # Score on the held-out eval subset (honest evaluation).
+                left_metrics = self._evaluate(
+                    X_eval[eval_left], y_eval[eval_left], left_pred,
+                    None if w_eval is None else w_eval[eval_left],
+                )
+                right_metrics = self._evaluate(
+                    X_eval[~eval_left], y_eval[~eval_left], right_pred,
+                    None if w_eval is None else w_eval[~eval_left],
+                )
+                score = self.criterion.calculate_score(left_metrics, right_metrics)
+                ranking.append((feat_idx, thr, score))
+                if score > best_score:
+                    best_score = score
+                    best_split = (feat_idx, thr)
+
+        ranking.sort(key=lambda x: x[2], reverse=True)
+        if best_split is None:
+            return None
+        return (best_split[0], best_split[1], best_score, ranking)
+
     def _evaluate_feature(
+
         self,
         feat_idx: int,
         X_node: np.ndarray,
