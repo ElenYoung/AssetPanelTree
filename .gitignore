@@ -110,6 +110,8 @@ output/
 *.jpeg
 *.pdf
 
+docs/OPTIMIZATION_PLAN.md
+
 # Data files
 *.csv
 *.parquet
