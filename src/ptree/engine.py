@@ -63,14 +63,25 @@ class PanelTreeEngine:
         it will be instantiated with ``predictor_params``.
     criterion : CriterionBase
         Splitting-quality criterion.
-    split_thresholds : list of float, default [0.3, 0.5, 0.7]
+    split_thresholds : list of float or "adaptive", default [0.3, 0.5, 0.7]
         Candidate thresholds applied to (possibly rank-standardised) features.
+        If the string ``"adaptive"`` is given, per-node, per-feature quantile
+        thresholds (see ``adaptive_quantiles``) are used instead of a single
+        global list — more robust for non-uniform feature distributions.
+    adaptive_quantiles : list of float, default [0.25, 0.5, 0.75]
+        Quantiles used to derive thresholds when ``split_thresholds="adaptive"``.
     max_depth : int, default 3
         Maximum tree depth.
     min_samples : int, default 100
         Minimum samples in a node for it to be considered for splitting.
         Also used to skip feature-threshold combos that produce too-small
         child nodes.
+    min_impurity_decrease : float, default 0.0
+        Minimum criterion score the best split must achieve for the node to be
+        split; if the best score is below this value the node becomes a leaf.
+        The default ``0.0`` preserves the original behaviour (any non-negative
+        score splits).
+
     fast_mode : bool, default False
         Enable *Feature Persistence* – prioritise top-ranked features from
         the parent node in child-node searches.
@@ -89,9 +100,11 @@ class PanelTreeEngine:
         self,
         predictor: Union[PredictorBase, Type[PredictorBase]] = RidgeRegressor,
         criterion: CriterionBase = R2DiffCriterion(),
-        split_thresholds: Optional[List[float]] = None,
+        split_thresholds: Optional[Union[List[float], str]] = None,
         max_depth: int = 3,
         min_samples: int = 100,
+        min_impurity_decrease: float = 0.0,
+        adaptive_quantiles: Optional[List[float]] = None,
         fast_mode: bool = False,
         early_stopping_threshold: Optional[float] = None,
         n_jobs: int = 1,
@@ -110,10 +123,25 @@ class PanelTreeEngine:
             self._predictor_template = predictor
 
         self.criterion = criterion
-        self.split_thresholds = split_thresholds or [0.3, 0.5, 0.7]
+        # ``split_thresholds`` may be a fixed list (default) or the string
+        # "adaptive" (per-node quantile thresholds, see ``adaptive_quantiles``).
+        if isinstance(split_thresholds, str):
+            if split_thresholds != "adaptive":
+                raise ValueError(
+                    "split_thresholds must be a list of floats or the string "
+                    f"'adaptive', got {split_thresholds!r}."
+                )
+            self.adaptive_thresholds = True
+            self.split_thresholds = "adaptive"
+        else:
+            self.adaptive_thresholds = False
+            self.split_thresholds = split_thresholds or [0.3, 0.5, 0.7]
+        self.adaptive_quantiles = adaptive_quantiles or [0.25, 0.5, 0.75]
         self.max_depth = max_depth
         self.min_samples = min_samples
+        self.min_impurity_decrease = min_impurity_decrease
         self.fast_mode = fast_mode
+
         self.early_stopping_threshold = early_stopping_threshold
         self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
         self.verbose = verbose
@@ -306,8 +334,18 @@ class PanelTreeEngine:
             return node
 
         feat_idx, threshold, score, ranking = best
+
+        # B4: minimum-impurity-decrease stopping criterion.  If the best split
+        # does not improve the criterion by at least ``min_impurity_decrease``,
+        # keep the node as a leaf.  Default ``0.0`` preserves prior behaviour.
+        if score < self.min_impurity_decrease:
+            node.is_leaf = True
+            node.elapsed_time = time.time() - t0
+            return node
+
         feat_name = self._feature_names[feat_idx]
         node.is_leaf = False
+
         node.split_feature = feat_name
         node.split_threshold = threshold
         node.split_score = score
@@ -366,9 +404,12 @@ class PanelTreeEngine:
         (feature_index, threshold, criterion_score, ranking_list) or None
         """
         n_features = X_node.shape[1]
-        thresholds = self.split_thresholds
+        # ``thresholds`` is either the fixed global list or, in adaptive mode,
+        # computed per-feature inside ``_evaluate_feature`` (passed as None).
+        thresholds = None if self.adaptive_thresholds else self.split_thresholds
 
         # Determine feature evaluation order (priority caching)
+
         if self.fast_mode and parent_ranking is not None:
             # Prioritise top 50% features from parent
             top_k = max(1, len(parent_ranking) // 2)
@@ -465,10 +506,18 @@ class PanelTreeEngine:
         Returns a list of ``(feat_idx, threshold, score)`` for thresholds that
         produce two sufficiently-large children.  Pure w.r.t. engine state, so
         it can be dispatched to a worker thread/process.
+
+        When ``thresholds`` is ``None`` (adaptive mode), the candidate
+        thresholds are this feature's empirical quantiles within the node
+        (``adaptive_quantiles``), de-duplicated to avoid redundant work.
         """
         col = X_node[:, feat_idx]
+        if thresholds is None:
+            qs = np.quantile(col, self.adaptive_quantiles)
+            thresholds = sorted(set(float(q) for q in qs))
         results: List[Tuple[int, float, float]] = []
         for thr in thresholds:
+
             mask_left = col < thr
             n_left = int(mask_left.sum())
             n_right = mask_left.shape[0] - n_left
