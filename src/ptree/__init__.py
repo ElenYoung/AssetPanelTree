@@ -37,8 +37,11 @@ from ptree.predictors import (
     RidgeRegressor,
     VolWeightedRidgeRegressor,
     RidgeLogitClassifier,
+    ElasticNetRegressor,
+    PLSRegressor,
     SelfDefinedPredictor,
 )
+
 from ptree.criteria import (
     CriterionBase,
     R2DiffCriterion,
@@ -61,8 +64,11 @@ __all__ = [
     "RidgeRegressor",
     "VolWeightedRidgeRegressor",
     "RidgeLogitClassifier",
+    "ElasticNetRegressor",
+    "PLSRegressor",
     "SelfDefinedPredictor",
     # Criteria
+
     "CriterionBase",
     "R2DiffCriterion",
     "WeightedR2DiffCriterion",

@@ -359,7 +359,238 @@ class RidgeLogitClassifier(PredictorBase):
         }
 
 
+class ElasticNetRegressor(PredictorBase):
+    """Elastic-Net regression via coordinate descent (L1 + L2 penalty).
+
+    Minimises ``(1/2n)||y - Xb||^2 + alpha*l1_ratio*||b||_1
+    + 0.5*alpha*(1-l1_ratio)*||b||_2^2``.  Useful for sparse factor selection
+    on highly-correlated characteristics.  Unlike Ridge, this predictor has no
+    closed-form sufficient-statistic update, so the engine fits it directly on
+    each candidate child (it does not participate in the A1 incremental path).
+
+    Parameters
+    ----------
+    alpha : float, default 1.0
+        Overall regularisation strength.
+    l1_ratio : float, default 0.5
+        Mix between L1 (``1.0``) and L2 (``0.0``).
+    max_iter : int, default 1000
+    tol : float, default 1e-4
+    fit_intercept : bool, default True
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        l1_ratio: float = 0.5,
+        max_iter: int = 1000,
+        tol: float = 1e-4,
+        fit_intercept: bool = True,
+    ):
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.max_iter = max_iter
+        self.tol = tol
+        self.fit_intercept = fit_intercept
+        self._coef: Optional[np.ndarray] = None
+        self._intercept: float = 0.0
+
+    @staticmethod
+    def _soft_threshold(rho: float, lam: float) -> float:
+        if rho > lam:
+            return rho - lam
+        if rho < -lam:
+            return rho + lam
+        return 0.0
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> "ElasticNetRegressor":
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        n, p = X.shape
+
+        if weights is not None:
+            sw = np.sqrt(weights)
+            Xw = X * sw[:, None]
+            yw = y * sw
+        else:
+            Xw, yw = X, y
+
+        # Centre for the intercept (fit on centred data, recover intercept).
+        if self.fit_intercept:
+            x_mean = Xw.mean(axis=0)
+            y_mean = float(yw.mean())
+            Xc = Xw - x_mean
+            yc = yw - y_mean
+        else:
+            x_mean = np.zeros(p)
+            y_mean = 0.0
+            Xc, yc = Xw, yw
+
+        beta = np.zeros(p)
+        col_norm_sq = np.sum(Xc**2, axis=0)
+        l1 = self.alpha * self.l1_ratio * n
+        l2 = self.alpha * (1.0 - self.l1_ratio) * n
+        residual = yc - Xc @ beta
+
+        for _ in range(self.max_iter):
+            max_delta = 0.0
+            for j in range(p):
+                if col_norm_sq[j] == 0.0:
+                    continue
+                # Add back feature j's contribution.
+                residual += Xc[:, j] * beta[j]
+                rho = Xc[:, j] @ residual
+                new_bj = self._soft_threshold(rho, l1) / (col_norm_sq[j] + l2)
+                max_delta = max(max_delta, abs(new_bj - beta[j]))
+                beta[j] = new_bj
+                residual -= Xc[:, j] * beta[j]
+            if max_delta < self.tol:
+                break
+
+        self._coef = beta
+        if self.fit_intercept:
+            self._intercept = y_mean - float(x_mean @ beta)
+        else:
+            self._intercept = 0.0
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        assert self._coef is not None, "Model not fitted."
+        return np.asarray(X, dtype=np.float64) @ self._coef + self._intercept
+
+    def get_coefficients(self) -> Optional[np.ndarray]:
+        return self._coef
+
+    def get_intercept(self) -> Optional[float]:
+        return self._intercept
+
+    def get_params(self) -> Dict[str, Any]:
+        return {
+            "alpha": self.alpha,
+            "l1_ratio": self.l1_ratio,
+            "max_iter": self.max_iter,
+            "tol": self.tol,
+            "fit_intercept": self.fit_intercept,
+        }
+
+
+class PLSRegressor(PredictorBase):
+    """Partial Least Squares regression (NIPALS, single response).
+
+    Projects the (possibly highly-collinear) characteristics onto a small set
+    of latent components that maximise covariance with the target, then
+    regresses on them.  Effective when factors are strongly correlated.  Like
+    Elastic-Net, it has no incremental sufficient-statistic form.
+
+    Parameters
+    ----------
+    n_components : int, default 2
+        Number of latent components (capped at the feature count).
+    fit_intercept : bool, default True
+    """
+
+    def __init__(self, n_components: int = 2, fit_intercept: bool = True):
+        self.n_components = n_components
+        self.fit_intercept = fit_intercept
+        self._coef: Optional[np.ndarray] = None
+        self._intercept: float = 0.0
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> "PLSRegressor":
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n, p = X.shape
+
+        if weights is not None:
+            sw = np.sqrt(weights)
+            Xw = X * sw[:, None]
+            yw = y * sw
+        else:
+            Xw, yw = X, y
+
+        if self.fit_intercept:
+            x_mean = Xw.mean(axis=0)
+            y_mean = float(yw.mean())
+        else:
+            x_mean = np.zeros(p)
+            y_mean = 0.0
+        Xc = Xw - x_mean
+        yc = yw - y_mean
+
+        k = max(1, min(self.n_components, p))
+        # NIPALS deflation accumulating the regression coefficient in X-space.
+        W = np.zeros((p, k))
+        P = np.zeros((p, k))
+        Q = np.zeros(k)
+        E = Xc.copy()
+        f = yc.copy()
+
+        for a in range(k):
+            w = E.T @ f
+            norm = np.linalg.norm(w)
+            if norm < 1e-12:
+                k = a
+                break
+            w = w / norm
+            t = E @ w
+            tt = float(t @ t)
+            if tt < 1e-12:
+                k = a
+                break
+            p_load = (E.T @ t) / tt
+            q = float((f @ t) / tt)
+            E = E - np.outer(t, p_load)
+            f = f - q * t
+            W[:, a] = w
+            P[:, a] = p_load
+            Q[a] = q
+
+        if k == 0:
+            beta = np.zeros(p)
+        else:
+            W, P, Q = W[:, :k], P[:, :k], Q[:k]
+            # B = W (P^T W)^{-1} Q
+            PtW = P.T @ W
+            try:
+                inv = np.linalg.inv(PtW)
+            except np.linalg.LinAlgError:
+                inv = np.linalg.pinv(PtW)
+            beta = W @ inv @ Q
+
+        self._coef = beta
+        self._intercept = y_mean - float(x_mean @ beta) if self.fit_intercept else 0.0
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        assert self._coef is not None, "Model not fitted."
+        return np.asarray(X, dtype=np.float64) @ self._coef + self._intercept
+
+    def get_coefficients(self) -> Optional[np.ndarray]:
+        return self._coef
+
+    def get_intercept(self) -> Optional[float]:
+        return self._intercept
+
+    def get_params(self) -> Dict[str, Any]:
+        return {
+            "n_components": self.n_components,
+            "fit_intercept": self.fit_intercept,
+        }
+
+
 class SelfDefinedPredictor(PredictorBase):
+
     """Template for user-defined predictors.
 
     Users should subclass this and implement ``fit`` / ``predict``.

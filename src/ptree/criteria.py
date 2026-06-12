@@ -191,7 +191,8 @@ class ClassificationCriterion(CriterionBase):
         Same balance penalty as :class:`R2DiffCriterion`.
     """
 
-    _VALID_METRICS = {"precision", "f1", "auc"}
+    _VALID_METRICS = {"precision", "f1", "auc", "logloss"}
+
 
     def __init__(
         self,
@@ -279,11 +280,14 @@ def evaluate_classification(
 
     Returns
     -------
-    dict with keys: ``precision``, ``f1``, ``auc``, ``n_samples``.
+    dict with keys: ``precision``, ``f1``, ``auc``, ``logloss``, ``n_samples``.
     """
     n = len(y_true)
     if n == 0:
-        return {"precision": 0.0, "f1": 0.0, "auc": 0.5, "n_samples": 0}
+        return {
+            "precision": 0.0, "f1": 0.0, "auc": 0.5,
+            "logloss": np.inf, "n_samples": 0,
+        }
 
     y_pred = (y_proba >= threshold).astype(int)
     tp = int(np.sum((y_pred == 1) & (y_true == 1)))
@@ -297,12 +301,22 @@ def evaluate_classification(
     # Simple AUC via Mann–Whitney U statistic
     auc = _auc_mannwhitney(y_true, y_proba)
 
+    # Binary cross-entropy (log loss); lower is better.  Probabilities are
+    # clipped to avoid ``log(0)``.  The split criterion compares the *absolute
+    # difference* between children, so the sign convention is immaterial.
+    eps = 1e-12
+    p_clip = np.clip(np.asarray(y_proba, dtype=np.float64), eps, 1.0 - eps)
+    yt = np.asarray(y_true, dtype=np.float64)
+    logloss = float(-np.mean(yt * np.log(p_clip) + (1.0 - yt) * np.log(1.0 - p_clip)))
+
     return {
         "precision": float(precision),
         "f1": float(f1),
         "auc": float(auc),
+        "logloss": logloss,
         "n_samples": n,
     }
+
 
 
 def _auc_mannwhitney(y_true: np.ndarray, y_score: np.ndarray) -> float:
