@@ -256,6 +256,55 @@ $$
 | 主要产物 | 平均预测 | 平均预测 **+ 共识聚类 + regime 概率** |
 | 降的是 | 预测方差 | 预测方差 **+ 分区方差** |
 
+### 5.8 How to Identify High-Predictability Samples in a Forest
+
+这是 P-Forest 相对单棵 P-Tree 最容易引起困惑的地方，单独说清楚。
+
+**单棵 P-Tree 怎么筛高可预测样本。** 你沿树读出**一条人类可读的硬规则路径**，落到某个高 $R^2$ 叶子，例如
+
+$$
+\{\,\tilde x_{\cdot,1} > 0.7 \ \wedge\ \tilde x_{\cdot,3} < 0.3\,\}\ \Rightarrow\ \text{高可预测 regime}.
+$$
+
+直观、可解释，但**高方差**——数据轻微扰动会让胜出的 $(k^*,c^*)$ 翻转，整条规则随之改变。
+
+**P-Forest 怎么筛高可预测样本。** 森林里**不存在那条唯一规则**（$B$ 棵树各有各的分区）。取而代之的是一个**软分数**：§5.4 的 regime 隶属概率
+
+$$
+\widehat{P}(\text{高可预测}\mid x) \;=\; \frac{1}{B}\sum_{b=1}^{B}\mathbf 1\big[\ell_b(x)\in\mathcal H_b\big]\ \in[0,1],
+$$
+
+即"有多少比例的树把样本 $x$ 路由进了高 $R^2$ 叶子"（$\mathcal H_b$ = 第 $b$ 棵树中 $R^2$ 高于其叶子中位数的叶子集合）。**筛选方式与单树完全平行，只是把硬规则换成概率阈值**：
+
+```python
+forest.fit(X, y, feature_names, time_index=...)
+p = forest.regime_membership(X)     # 每个样本一个 [0,1] 概率
+X_high = X[p > 0.7]                 # 类比单树里的 “x1>0.7 & x3<0.3”
+```
+
+> 一句话：单树写 `x1>0.7 & x3<0.3` 选样本，P-Forest 写 `regime_membership(X) > 0.7` 选样本。后者的判定来自 **$B$ 棵树的投票共识**，不依赖任何单一脆弱阈值，因此更稳健。
+
+**两类产物的本质区别。**
+
+| 维度 | 单棵 P-Tree | P-Forest |
+|------|------------|----------|
+| 如何识别高可预测样本 | 读出**一条规则路径** $x_1>0.7\wedge x_3<0.3$ | `regime_membership(X)` 给**概率**，阈值化即可 |
+| 判定形态 | 硬 0/1 标签 | 软 $[0,1]$ 概率 |
+| 可解释性 | **强**（直接是 if-else 规则） | 弱（无单一规则），但更**鲁棒** |
+| 稳定性 | 低（规则随扰动翻转） | 高（$B$ 棵树平均） |
+| 额外产物 | 单一分区 + 预测马赛克 | 袋装预测 + **共识矩阵** + OOB $R^2$ |
+
+**想兼顾鲁棒与可读规则：代理树（surrogate tree）。** 若既要森林的稳健判定、又要单树式的 if-else 解释，可用一棵浅树去拟合森林给出的 0/1 标签，把"森林共识"翻译回近似规则：
+
+```python
+p = forest.regime_membership(X)
+label = (p > 0.7).astype(int)       # 高可预测 = 1
+# 再用一棵浅 P-Tree / 普通决策树拟合 X -> label,
+# 读出近似的 “x1>?, x3<?” 规则
+```
+
+**别混淆 `regime_membership` 与 `coassociation_matrix`。** 前者回答"**这个样本是否高可预测**"（逐样本概率，可直接阈值化筛样本）；后者 $C_{ij}$ 回答"**哪些样本一致地同属一个 regime**"（成对相似度，适合喂给谱聚类得到稳定的元 regime），二者用途不同。
+
 ---
 
 ## 6. P-Boost: A Boosting Ensemble
