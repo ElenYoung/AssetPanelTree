@@ -1,5 +1,5 @@
 [project]
-name = "ptree-panel"
+name = "aptree"
 version = "0.1.0"
 description = "A supervised clustering algorithm for panel data, commonly used in quantitative finance to identify time-varying, cross-sectional predictability regimes."
 readme = "README.md"
@@ -59,7 +59,7 @@ dev = [
     "ruff>=0.1.0",
 ]
 all = [
-    "ptree-panel[viz,parallel,fast,boost,dev]",
+    "aptree[viz,parallel,fast,boost,dev]",
 ]
 
 
