@@ -1,7 +1,11 @@
 """
-PanelTreeEngine: recursive splitting, pruning, feature-priority caching,
-incremental matrix updates, and multiprocessing support.
+PanelTreeEngine: recursive splitting with cost-complexity pruning, honest
+splits, feature-priority caching, incremental (Ridge) matrix updates, optional
+joblib feature-dimension parallelism, node-level random feature subsetting
+(``max_features``) and a random-threshold splitter (``splitter="random"``) for
+ensemble use.
 """
+
 
 from __future__ import annotations
 

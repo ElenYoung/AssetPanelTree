@@ -67,12 +67,14 @@ P-Tree recursively splits the full sample into disjoint leaf nodes using asset c
 src/ptree/
 ├── __init__.py          # Package exports
 ├── data_handler.py      # DataHandler – alignment, missing-value fill, rank standardisation, volatility
-├── predictors.py        # PredictorBase, RidgeRegressor, VolWeightedRidgeRegressor, RidgeLogitClassifier, SelfDefinedPredictor
-├── criteria.py          # CriterionBase, R2DiffCriterion, ClassificationCriterion, evaluation helpers
+├── predictors.py        # PredictorBase, RidgeRegressor, VolWeightedRidgeRegressor, RidgeLogitClassifier, ElasticNetRegressor, PLSRegressor, SelfDefinedPredictor
+├── criteria.py          # CriterionBase, R2DiffCriterion, WeightedR2DiffCriterion, MeanVarianceCriterion, ClassificationCriterion, evaluation helpers
 ├── node.py              # PanelTreeNode – per-node metadata container
-├── engine.py            # PanelTreeEngine – recursive splitting, incremental matrix updates, feature-priority caching
+├── engine.py            # PanelTreeEngine – recursive splitting, cost-complexity pruning, honest splits, incremental matrix updates, feature-priority caching, joblib parallelism
+├── ensemble.py          # PanelForest (P-Forest bagging), BoostedPanelTree (P-Boost residual boosting)
 └── visualization.py     # NodeReporter (text/DataFrame reports), MosaicVisualizer (heatmap)
 ```
+
 
 ## Quick Start
 
@@ -139,7 +141,10 @@ All predictors inherit from `PredictorBase` and implement `fit()` / `predict()`.
 | `RidgeRegressor` | Standard Ridge regression (closed-form) |
 | `VolWeightedRidgeRegressor` | Inverse-volatility weighted Ridge (handles heteroscedasticity) |
 | `RidgeLogitClassifier` | Ridge logistic regression via IRLS |
+| `ElasticNetRegressor` | L1+L2 coordinate-descent regression (sparse factor selection) |
+| `PLSRegressor` | Partial least squares (handles highly-correlated factors) |
 | `SelfDefinedPredictor` | User-defined model base class |
+
 
 **Custom Predictor Example:**
 
@@ -162,8 +167,11 @@ Split-quality criteria evaluate whether a candidate split produces child nodes w
 
 | Class | Description |
 |---|---|
-| `R2DiffCriterion` | Maximise \|R²_L − R²_R\| (regression) |
-| `ClassificationCriterion` | Maximise difference in Precision / F1 / AUC (classification) |
+| `R2DiffCriterion` | Maximise \|R²_L − R²_R\| (regression, **default**) |
+| `WeightedR2DiffCriterion` | \|R²_L − R²_R\| with balance / sample-size shrinkage / adjusted-R² penalties (stricter, anti-overfit variant) |
+| `MeanVarianceCriterion` | Tangency (max) Sharpe of the two child long-short portfolios — aligns splits with the SDF / efficient-frontier objective (requires `fit(..., time_index=...)`) |
+| `ClassificationCriterion` | Maximise difference in Precision / F1 / AUC / LogLoss (classification) |
+
 
 ### PanelTreeEngine
 
@@ -173,13 +181,32 @@ The main engine for building and querying Panel Trees.
 |---|---|---|
 | `predictor` | `RidgeRegressor` | Leaf-node predictor (instance or class) |
 | `criterion` | `R2DiffCriterion()` | Split-quality criterion |
-| `split_thresholds` | `[0.3, 0.5, 0.7]` | Candidate split points on (rank-standardised) feature values |
+| `split_thresholds` | `[0.3, 0.5, 0.7]` | Candidate split points on (rank-standardised) feature values. Pass `"adaptive"` to use per-node, per-feature quantile thresholds instead |
+| `adaptive_quantiles` | `[0.25, 0.5, 0.75]` | Quantiles used when `split_thresholds="adaptive"` |
 | `max_depth` | `3` | Maximum tree depth |
 | `min_samples` | `100` | Minimum observations per node |
+| `min_impurity_decrease` | `0.0` | Minimum criterion score the best split must reach; below it the node becomes a leaf |
+| `honest` | `False` | Honest splits — fit leaf models on one in-node subset and evaluate split quality on a disjoint subset, removing the selection bias of fitting and scoring on the same data |
+| `honest_frac` | `0.5` | Fraction of in-node samples held out as the honest evaluation set |
+| `honest_refit_full` | `True` | Refit each final leaf model on the full in-node sample after honest split selection |
+| `random_state` | `None` | Seed for honest splitting, random feature subsetting and the random splitter (reproducibility) |
 | `fast_mode` | `False` | Enable feature-priority caching from parent nodes |
 | `early_stopping_threshold` | `None` | Stop searching if criterion exceeds this value (requires `fast_mode`) |
-| `n_jobs` | `1` | Parallel workers (`-1` = all cores) |
+| `n_jobs` | `1` | Parallel workers (`-1` = all cores), used for feature-dimension parallelism (requires `joblib`) |
+| `parallel_backend` | `"threads"` | joblib backend for parallel feature evaluation (`"threads"` or `"processes"`) |
+| `max_features` | `None` | Node-level random feature-subset size for splits (`"sqrt"`, `"log2"`, int, float or `None`); used by ensembles to decorrelate trees |
+| `splitter` | `"best"` | `"best"` exhaustively scans `split_thresholds`; `"random"` draws random thresholds (Extra-Trees style) |
+| `n_random_splits` | `1` | Number of random thresholds drawn per feature when `splitter="random"` |
+| `keep_node_stats` | `False` | Retain per-node cached matrices after splitting (uses more memory; useful for debugging) |
 | `verbose` | `1` | Logging verbosity (0=silent, 1=per-level, 2=per-candidate) |
+
+**Pruning / honest helpers**
+
+| Method | Description |
+|---|---|
+| `engine.prune(ccp_alpha)` | Cost-complexity post-pruning: bottom-up, collapse subtrees whose score gain does not justify their leaf-count penalty `ccp_alpha` |
+| `engine.cost_complexity_pruning_path()` | Return `(ccp_alphas, n_leaves, scores)` to help select `ccp_alpha` |
+
 
 ## Output & Query API Reference
 
@@ -483,15 +510,70 @@ Set `verbose=2` to view per-candidate (feature, threshold) evaluation results.
 
 ## Performance Optimisations
 
-1. **Incremental matrix updates** – For Ridge models, $X^TWX$ and $X^TWy$ are cached at each node. Child-node statistics are obtained by subtraction, avoiding redundant matrix multiplications.
+1. **Incremental matrix updates** – For Ridge models, $X^TWX$ and $X^TWy$ are cached at each node. Only the *smaller* child's statistics are computed directly (a single matmul); the larger child is obtained by subtracting it from the cached parent, halving the matrix-multiplication work per candidate split.
 2. **Feature-priority caching** – When `fast_mode=True`, child nodes first evaluate the top-50% features from the parent, with optional early stopping.
-3. **Multiprocessing** – Node-level parallelism via `n_jobs` for high-dimensional feature sets.
+3. **Feature-dimension parallelism** – When `n_jobs != 1` (and `joblib` is installed), candidate features are evaluated in parallel. The default `"threads"` backend keeps NumPy/BLAS matmuls GIL-free with zero data copying; switch to `parallel_backend="processes"` for heavy pure-Python custom predictors.
+4. **Cost-complexity pruning & honest splits** – `engine.prune(ccp_alpha)` removes over-fit subtrees post-hoc, while `honest=True` evaluates split quality on a held-out in-node subset to remove the selection bias of fitting and scoring on the same data.
+5. **Vectorised AUC** – Classification AUC uses an `O(n log n)` rank-based Mann–Whitney statistic instead of the former `O(n⁺·n⁻)` double loop.
+
+## Ensembles (P-Forest & P-Boost)
+
+A single Panel Tree is a *high-variance* estimator — small data perturbations can flip the greedily-chosen split and produce a completely different partition. The `ensemble` module provides two derived algorithms (mirroring the decision-tree → random-forest / gradient-boosting relationship) that act on the **prediction / target layer** while each tree's split criterion stays the unchanged `R2Diff` rule.
+
+### PanelForest (P-Forest — bagging)
+
+Grows many decorrelated P-Trees via **time-block bootstrap** (contiguous blocks of `block_size` periods resampled with replacement, preserving serial autocorrelation) plus **node-level random feature subsets** (`max_features`), then aggregates at the output layer.
+
+```python
+from ptree import PanelForest
+
+forest = PanelForest(
+    n_estimators=100, max_features="sqrt", block_size=5,
+    base_params={"max_depth": 3, "min_samples": 100},
+    n_jobs=-1, random_state=0,
+)
+forest.fit(X, y, feature_names=dh.feature_names, time_index="date")
+
+forest.predict(X)                  # bagged mean ŷ (variance reduction)
+forest.regime_membership(X)        # soft P(obs ∈ high-predictability regime) ∈ [0,1]
+forest.coassociation_matrix(X)     # consensus similarity C[i,j] ∈ [0,1] (same-leaf frequency)
+forest.oob_score_                  # out-of-bag R² (unselected time blocks)
+```
+
+| Output | Description |
+|---|---|
+| `.predict(X)` | Bagged mean prediction across trees (lower variance than a single tree) |
+| `.regime_membership(X)` | Fraction of trees routing each observation into a *high-R²* leaf — a smooth, robust upgrade of the 0/1 mosaic |
+| `.coassociation_matrix(X)` | Consensus / co-association matrix; fraction of trees in which two observations share a leaf (a precomputed affinity for spectral clustering) |
+| `.oob_score_` | Out-of-bag R² estimated on each tree's unselected time blocks |
+
+> **Note:** P-Forest's gains are largest when predictability is driven by *several weakly-identified features*. If a single strong feature dominates, all trees split on it, become highly correlated, and the ensemble adds little.
+
+### BoostedPanelTree (P-Boost — residual boosting)
+
+Boosts the **target/residual** (not the criterion): each round strips the predictability already explained by the running ensemble and re-grows a fresh P-Tree on the residual, uncovering the *next, weaker* regime the greedy single tree would have masked.
+
+```python
+from ptree import BoostedPanelTree
+
+booster = BoostedPanelTree(
+    n_estimators=50, learning_rate=0.1, max_depth=2,
+    subsample=1.0, random_state=0,
+)
+booster.fit(X, y, feature_names=dh.feature_names)
+
+booster.predict(X)            # ν · Σ_m tree_m.predict(X)
+booster.residual_norms_       # residual L2-norm per round (monotone ↓; flat ⇒ self-limited)
+```
+
+On single-feature-dominated data P-Boost is **self-limiting**: once the first tree explains the dominant regime, the residual is near-noise and later trees add almost nothing (visible in `residual_norms_`). Set `splitter="random"` via `base_params` for an Extra-Trees-style variant that injects extra diversity.
 
 ## Requirements
 
 - Python ≥ 3.10
 - `numpy`, `pandas`
 - `matplotlib`, `seaborn` (optional, for visualisation)
+
 
 ## Contributing
 

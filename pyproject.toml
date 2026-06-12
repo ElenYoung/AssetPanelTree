@@ -48,15 +48,20 @@ parallel = [
 fast = [
     "scipy>=1.9.0",
 ]
+boost = [
+    "lightgbm>=3.3.0",
+]
 dev = [
+
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
 all = [
-    "ptree-panel[viz,parallel,fast,dev]",
+    "ptree-panel[viz,parallel,fast,boost,dev]",
 ]
+
 
 
 [project.urls]
