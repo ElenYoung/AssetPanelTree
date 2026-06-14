@@ -1,6 +1,6 @@
 [project]
 name = "aptree"
-version = "0.2.0"
+version = "0.2.1"
 description = "A supervised clustering algorithm for panel data, commonly used in quantitative finance to identify time-varying, cross-sectional predictability regimes."
 readme = "README.md"
 license = "MIT"
