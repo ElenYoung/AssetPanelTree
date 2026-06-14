@@ -25,8 +25,7 @@ A **supervised clustering algorithm** designed for **panel data**, commonly used
 >   `metrics["n_samples"]` fallback).
 >
 > All v0.1 defaults are preserved — existing code keeps producing identical
-> trees. See `docs/ptree_improvement_suggestions.md` for design rationale.
-
+> trees. 
 ## Installation
 
 ```bash

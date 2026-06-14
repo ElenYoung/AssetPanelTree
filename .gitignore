@@ -2,6 +2,8 @@
 pforest_statements.md
 project-statements.md
 
+docs/ptree_improvement_suggestions.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
