@@ -6,6 +6,27 @@
 
 A **supervised clustering algorithm** designed for **panel data**, commonly used in quantitative finance to identify time-varying, cross-sectional predictability regimes.
 
+> **What's new in v0.2** — Major usability + diagnostics upgrade:
+> - `engine.evaluate(X_oos, y_oos, time_col, metrics=("r2", "rank_ic"))` →
+>   per-node OOS R² / Rank-IC in a single call (new `NodeEvalResult` container).
+> - `NodeReporter.print_tree(evaluation=..., show_child_diff=True)` and
+>   `NodeReporter.to_graphviz(...)` for richer tree visualisation.
+> - `engine.predict_leaves(X)` / `engine.predict_node_path(X)` — public
+>   routing API (no more re-implementing private helpers).
+> - `engine.tune_ccp_alpha(X_val, y_val, metric="r2")` — pruning-curve
+>   tuning in one line.
+> - New `RankICDiffCriterion` (scale-free, robust on low-SNR panels);
+>   `WeightedR2DiffCriterion` now exposes `min_child_weight`.
+> - `PanelForest(regime_metric="rank_ic", regime_aggregation="oof")` —
+>   OOB-driven regime scoring instead of brittle train-R².
+> - `MosaicVisualizer.plot_mosaic` default cmap → `"RdBu_r"` (colour-blind
+>   safe) with explicit `center` kwarg.
+> - `node.n_samples` now persists across `pickle` (no more dependency on
+>   `metrics["n_samples"]` fallback).
+>
+> All v0.1 defaults are preserved — existing code keeps producing identical
+> trees. See `docs/ptree_improvement_suggestions.md` for design rationale.
+
 ## Installation
 
 ```bash
@@ -83,8 +104,11 @@ src/ptree/
 ```python
 import numpy as np
 import pandas as pd
-from ptree import DataHandler, RidgeRegressor, R2DiffCriterion, PanelTreeEngine
-from ptree import NodeReporter, MosaicVisualizer
+from ptree import (
+    DataHandler, RidgeRegressor,
+    R2DiffCriterion, WeightedR2DiffCriterion, RankICDiffCriterion,
+    PanelTreeEngine, NodeReporter, MosaicVisualizer,
+)
 
 # 1. Prepare panel data (DataFrame with date, asset_id, and feature columns)
 dh = DataHandler(cs_rank_standardize=True)
@@ -94,11 +118,17 @@ X, y, vol_weights = dh.fit_transform(
     ret_series_for_vol=ret_series,       # optional, for VolWeightedRidge
 )
 
-# 2. Build the tree
+# 2. Build the tree.
+#    Recommended for low-SNR financial panels:
+#      WeightedR2DiffCriterion(balance=True, shrinkage_k=200,
+#                              min_child_weight=0.05)
+#    plus ``split_thresholds="adaptive"`` (per-node quantile thresholds).
+#    The default R2DiffCriterion is preserved for v0.1 reproducibility.
 engine = PanelTreeEngine(
     predictor=RidgeRegressor(alpha=1.0),
-    criterion=R2DiffCriterion(),
-    split_thresholds=[0.3, 0.5, 0.7],
+    criterion=WeightedR2DiffCriterion(balance=True, shrinkage_k=200),
+    split_thresholds="adaptive",
+    adaptive_quantiles=[0.25, 0.5, 0.75],
     max_depth=3,
     min_samples=100,
     fast_mode=False,
@@ -111,12 +141,33 @@ reporter = NodeReporter(engine)
 print(reporter.print_tree())           # text tree
 print(reporter.leaf_summary())         # DataFrame
 
-# 4. Prediction mosaic
+# 4. NEW in v0.2: per-node OOS evaluation in a single call.
+result = engine.evaluate(
+    X_oos, y_oos,
+    time_col="date",
+    metrics=("r2", "rank_ic"),
+)
+print(result.per_node_df.head())
+# Overlay OOS metrics on the text tree + show child-difference rows
+print(reporter.print_tree(evaluation=result, show_child_diff=True))
+# Or export a Graphviz DOT source for prettier rendering
+dot = reporter.to_graphviz(evaluation=result, show_child_diff=True)
+
+# 5. NEW in v0.2: public leaf-routing API (no more private helpers).
+leaf_ids = engine.predict_leaves(X_new)
+paths    = engine.predict_node_path(X_new.iloc[:5])
+
+# 6. NEW in v0.2: cost-complexity pruning tuned by OOS R² in one line.
+best_alpha, curve = engine.tune_ccp_alpha(X_val, y_val, metric="r2")
+engine.prune(best_alpha)
+
+# 7. Prediction mosaic. v0.2 changes the default cmap to ``"RdBu_r"``
+#    (colour-blind safe) and exposes an explicit ``center`` kwarg.
 viz = MosaicVisualizer(engine)
 mosaic = viz.build_mosaic(X, y, time_col="date", metric="r2")
 fig, ax = viz.plot_mosaic(mosaic)       # requires matplotlib & seaborn
 
-# 5. Retrieve leaf-node samples
+# 8. Retrieve leaf-node samples
 for leaf_id, indices in engine.get_leaf_samples().items():
     print(f"Leaf {leaf_id}: {len(indices)} observations")
 ```
@@ -169,10 +220,17 @@ Split-quality criteria evaluate whether a candidate split produces child nodes w
 
 | Class | Description |
 |---|---|
-| `R2DiffCriterion` | Maximise \|R²_L − R²_R\| (regression, **default**) |
-| `WeightedR2DiffCriterion` | \|R²_L − R²_R\| with balance / sample-size shrinkage / adjusted-R² penalties (stricter, anti-overfit variant) |
+| `R2DiffCriterion` | Maximise \|R²_L − R²_R\| (regression, default — fast & minimal; preserved for backward compatibility) |
+| `WeightedR2DiffCriterion` | **Recommended for real financial panels.** \|R²_L − R²_R\| with balance + sample-size shrinkage + adjusted-R² penalties + `min_child_weight` floor — directly addresses the "small-n child wins on inflated R²" failure mode of `R2DiffCriterion` |
+| `RankICDiffCriterion` (**new in v0.2**) | \|mean cross-sectional rank-IC_L − mean rank-IC_R\| — scale-free, robust on low-SNR / non-Gaussian targets (requires `fit(..., time_index=...)`) |
 | `MeanVarianceCriterion` | Tangency (max) Sharpe of the two child long-short portfolios — aligns splits with the SDF / efficient-frontier objective (requires `fit(..., time_index=...)`) |
 | `ClassificationCriterion` | Maximise difference in Precision / F1 / AUC / LogLoss (classification) |
+
+> **Recommendation for quant panels:**
+> use `WeightedR2DiffCriterion(balance=True, shrinkage_k=200, min_child_weight=0.05)`
+> (or `RankICDiffCriterion()` for very low-SNR targets) together with
+> `split_thresholds="adaptive"`. The default `R2DiffCriterion` is preserved
+> to keep v0.1.x golden baselines reproducible bit-for-bit.
 
 
 ### PanelTreeEngine
@@ -533,6 +591,10 @@ forest = PanelForest(
     n_estimators=100, max_features="sqrt", block_size=5,
     base_params={"max_depth": 3, "min_samples": 100},
     n_jobs=-1, random_state=0,
+    # NEW in v0.2: score "high-predictability" leaves on OOB samples
+    # instead of brittle train-R². Use "rank_ic" for low-SNR panels.
+    regime_metric="rank_ic",        # default "train_r2"
+    regime_aggregation="oof",       # default "train"
 )
 forest.fit(X, y, feature_names=dh.feature_names, time_index="date")
 
