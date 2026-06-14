@@ -1,31 +1,28 @@
 """
-P-Tree Visualization 完整示例（v0.2 新功能）
-=============================================
+aptree visualization demo (v0.2)
+================================
 
-本示例聚焦 aptree v0.2 引入的可视化能力，所有产物统一写到
-``example/outputs/`` 目录下，运行后可以直接查看。
+聚焦 aptree v0.2 引入的可视化能力。所有产物统一写入 ``example/outputs/``。
 
-包含 4 个可视化产物：
+包含 5 个可视化产物：
 
-1. **OOS 评估覆盖的文本树**：
-   ``NodeReporter.print_tree(evaluation=..., show_child_diff=True)``
-   把每个节点的样本外 R² / Rank-IC / Rank-IC IR 嵌入打印结果，
-   并显示父节点 vs 两个子节点的相对增益。
+1. **文本树（含 OOS）**：``NodeReporter.print_tree(evaluation=...,
+   show_child_diff=True)`` 在每个节点尾部追加样本外 R² / IC / IR，并显示
+   父节点对子节点的相对增益。指标按白名单输出，不再被 ``mse=…,
+   n_features=0`` 等噪音字段污染。
 
-2. **Graphviz DOT 导出**：
-   ``NodeReporter.to_graphviz(evaluation=..., show_child_diff=True,
-   leaf_fill=..., node_fill=...)`` 返回纯 DOT 字符串（不依赖
-   graphviz 二进制）。如果系统装了 Graphviz 与 ``python-graphviz``
-   包，会自动渲染为 SVG。
+2. **matplotlib 树形图**：``NodeReporter.plot_tree`` 纯 matplotlib 实现，
+   不依赖 graphviz 二进制，PNG 直接可看。
 
-3. **OOS 评估的 ccp_alpha 调参曲线**：
-   ``PanelTreeEngine.tune_ccp_alpha`` 在剪枝路径上扫描，
-   挑选验证集 Rank-IC 最高的剪枝强度。
+3. **Graphviz DOT 导出**：``NodeReporter.to_graphviz`` 现在用 HTML-like
+   ``<TABLE>`` 标签结构化（节点名 / 分裂规则 / 训练 / OOS 分行排版）。
 
-4. **预测马赛克热力图**：
-   ``MosaicVisualizer.plot_mosaic`` v0.2 默认改为发散色板
-   ``RdBu_r`` 并以 ``center=0.0`` 对齐零线，分别按 R² 与按 leaf 均值
-   做两个视角；同时演示自定义 ``cmap`` / ``center`` 的覆盖能力。
+4. **ccp_alpha 调参曲线**：``PanelTreeEngine.tune_ccp_alpha`` 在剪枝路径
+   上搜索验证集 Rank-IC 最高的剪枝强度。
+
+5. **预测马赛克热力图**：``MosaicVisualizer`` 现在内置自动配色（非负 →
+   ``viridis``，含负 → ``RdBu_r`` 且自动居中），不再把参数值写进标题；
+   新增 ``metric="mean"`` / ``"ic"`` 等真正可用的指标。
 """
 
 from __future__ import annotations
@@ -118,8 +115,6 @@ engine = PanelTreeEngine(
 )
 engine.fit(X_train, y_train, feature_names=dh.feature_names)
 
-# OOS evaluation: pass the date column so Rank-IC can be aggregated cross-sectionally
-# ``metrics=("r2","rank_ic")`` 同时产出 oos_r2 / oos_rank_ic_mean / oos_rank_ic_ir
 evaluation = engine.evaluate(
     X_val, y_val,
     time_col=X_val["date"].values,
@@ -140,7 +135,7 @@ print()
 # 3. Text tree with OOS overlay (and child-vs-parent diff)
 # ---------------------------------------------------------------------------
 print("=" * 64)
-print("3. NodeReporter.print_tree(evaluation=..., show_child_diff=True)")
+print("3. 文本树 + OOS 覆盖：NodeReporter.print_tree(...)")
 print("=" * 64)
 
 reporter = NodeReporter(engine)
@@ -155,24 +150,44 @@ print()
 
 
 # ---------------------------------------------------------------------------
-# 4. Graphviz DOT export + optional SVG render
+# 4. matplotlib tree plot (no Graphviz binary needed)
 # ---------------------------------------------------------------------------
 print("=" * 64)
-print("4. NodeReporter.to_graphviz(evaluation=..., show_child_diff=True)")
+print("4. 纯 matplotlib 树形图：NodeReporter.plot_tree(...)")
+print("=" * 64)
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+
+    tree_png = os.path.join(OUT_DIR, "tree.png")
+    reporter.plot_tree(
+        evaluation=evaluation,
+        show_child_diff=True,
+        save_path=tree_png,
+    )
+    print(f"  树形图已保存: {tree_png}")
+except ImportError:
+    print("  [提示] 安装 matplotlib 可生成树形图")
+print()
+
+
+# ---------------------------------------------------------------------------
+# 5. Graphviz DOT export + optional SVG render
+# ---------------------------------------------------------------------------
+print("=" * 64)
+print("5. Graphviz DOT 导出：NodeReporter.to_graphviz(...)")
 print("=" * 64)
 
 dot_source = reporter.to_graphviz(
     evaluation=evaluation,
     show_child_diff=True,
-    leaf_fill="#fff7e6",
-    node_fill="#eef5ff",
 )
 dot_path = os.path.join(OUT_DIR, "tree.dot")
 with open(dot_path, "w", encoding="utf-8") as f:
     f.write(dot_source)
 print(f"  DOT 源码已写入: {dot_path}")
 
-# Render to SVG only when both python-graphviz and the dot binary are present.
 try:
     import graphviz as _graphviz  # type: ignore
 
@@ -190,13 +205,12 @@ print()
 
 
 # ---------------------------------------------------------------------------
-# 5. ccp_alpha pruning sweep on the validation set
+# 6. ccp_alpha pruning sweep on the validation set
 # ---------------------------------------------------------------------------
 print("=" * 64)
-print("5. PanelTreeEngine.tune_ccp_alpha — 剪枝路径上的 Rank-IC 扫描")
+print("6. ccp_alpha 剪枝路径上的 Rank-IC 扫描")
 print("=" * 64)
 
-# Re-fit a deeper tree so the pruning path has something to sweep
 deep_engine = PanelTreeEngine(
     predictor=RidgeRegressor(alpha=1.0),
     criterion=R2DiffCriterion(),
@@ -219,10 +233,8 @@ sweep_csv = os.path.join(OUT_DIR, "ccp_alpha_sweep.csv")
 sweep.to_csv(sweep_csv, index=False)
 print(f"  曲线已写入: {sweep_csv}")
 
-# Plot the sweep if matplotlib is installed
 try:
     import matplotlib
-
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -230,26 +242,51 @@ try:
         {
             "font.sans-serif": ["Noto Sans CJK SC", "DejaVu Sans"],
             "axes.unicode_minus": False,
+            "axes.titleweight": "bold",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
         }
     )
 
-    fig, ax1 = plt.subplots(figsize=(7, 4))
-    ax1.plot(sweep["ccp_alpha"], sweep["oos_rank_ic"], marker="o",
-             color="#1f77b4", label="验证集 Rank-IC")
-    ax1.axvline(best_alpha, color="#1f77b4", linestyle=":",
-                label=f"best α={best_alpha:.4f}")
-    ax1.set_xlabel("ccp_alpha")
-    ax1.set_ylabel("Rank-IC", color="#1f77b4")
-    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    # Brand-ish blue / red, suitable for B&W print as well.
+    ic_color = "#1f4e79"
+    leaf_color = "#c0504d"
+
+    fig, ax1 = plt.subplots(figsize=(7.5, 4.2))
+    ax1.plot(
+        sweep["ccp_alpha"], sweep["oos_rank_ic"],
+        marker="o", linewidth=1.8,
+        color=ic_color, label="Validation Rank-IC",
+    )
+    ax1.axvline(
+        best_alpha, color=ic_color, linestyle=":", linewidth=1.2,
+        label=f"best α = {best_alpha:.4f}",
+    )
+    ax1.set_xlabel("Cost-complexity parameter α")
+    ax1.set_ylabel("Validation Rank-IC", color=ic_color)
+    ax1.tick_params(axis="y", labelcolor=ic_color)
+    ax1.grid(True, linewidth=0.4, alpha=0.4)
 
     ax2 = ax1.twinx()
-    ax2.plot(sweep["ccp_alpha"], sweep["n_leaves"], marker="s",
-             color="#d62728", label="叶子数")
-    ax2.set_ylabel("叶子数", color="#d62728")
-    ax2.tick_params(axis="y", labelcolor="#d62728")
+    ax2.spines["top"].set_visible(False)
+    ax2.plot(
+        sweep["ccp_alpha"], sweep["n_leaves"],
+        marker="s", linewidth=1.4, linestyle="--",
+        color=leaf_color, label="Number of leaves",
+    )
+    ax2.set_ylabel("Number of leaves", color=leaf_color)
+    ax2.tick_params(axis="y", labelcolor=leaf_color)
 
-    ax1.set_title("ccp_alpha sweep（Rank-IC vs 叶子数）")
-    ax1.legend(loc="lower left")
+    ax1.set_title("Cost-complexity pruning path")
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(
+        lines1 + lines2, labels1 + labels2,
+        loc="best", frameon=False, fontsize=9,
+    )
+
     fig.tight_layout()
     sweep_png = os.path.join(OUT_DIR, "ccp_alpha_sweep.png")
     fig.savefig(sweep_png, dpi=150)
@@ -261,52 +298,57 @@ print()
 
 
 # ---------------------------------------------------------------------------
-# 6. Mosaic heatmaps (default RdBu_r + center=0.0; and a custom variant)
+# 7. Mosaic heatmaps – defaults are now clean, metric-aware
 # ---------------------------------------------------------------------------
 print("=" * 64)
-print("6. MosaicVisualizer.plot_mosaic — 默认 RdBu_r + center=0.0")
+print("7. 预测马赛克：MosaicVisualizer.plot_mosaic(...)")
 print("=" * 64)
 
 viz = MosaicVisualizer(engine)
 mosaic_r2 = viz.build_mosaic(X_val, y_val, time_col="date", metric="r2")
 mosaic_mean = viz.build_mosaic(X_val, y_val, time_col="date", metric="mean")
+mosaic_ic = viz.build_mosaic(X_val, y_val, time_col="date", metric="ic")
 print(f"  R² 马赛克形状:   {mosaic_r2.shape}  (叶子 × 时间)")
 print(f"  Mean 马赛克形状: {mosaic_mean.shape}")
+print(f"  IC 马赛克形状:   {mosaic_ic.shape}")
 
 try:
     import matplotlib
-
     matplotlib.use("Agg")
 
-    # 6a: leaf-mean mosaic — divergent palette centered at 0 is meaningful
     mean_path = os.path.join(OUT_DIR, "mosaic_leaf_mean.png")
     viz.plot_mosaic(
         mosaic_mean,
-        title="叶子均值马赛克（v0.2 默认 RdBu_r，center=0.0）",
+        metric="mean",
         save_path=mean_path,
     )
     print(f"  叶子均值马赛克: {mean_path}")
 
-    # 6b: R² mosaic — override center because R² is non-negative
     r2_path = os.path.join(OUT_DIR, "mosaic_r2.png")
     viz.plot_mosaic(
         mosaic_r2,
-        title="叶子 R² 马赛克（cmap='viridis', center=None）",
+        metric="r2",
         save_path=r2_path,
-        cmap="viridis",
-        center=None,
     )
     print(f"  叶子 R² 马赛克: {r2_path}")
+
+    ic_path = os.path.join(OUT_DIR, "mosaic_ic.png")
+    viz.plot_mosaic(
+        mosaic_ic,
+        metric="ic",
+        save_path=ic_path,
+    )
+    print(f"  叶子 IC 马赛克: {ic_path}")
 except ImportError:
     print("  [提示] 安装 matplotlib + seaborn 可生成马赛克热力图")
 print()
 
 
 # ---------------------------------------------------------------------------
-# 7. RankIC criterion side-by-side (sanity check)
+# 8. RankIC criterion side-by-side (sanity check)
 # ---------------------------------------------------------------------------
 print("=" * 64)
-print("7. RankICDiffCriterion：用同一份数据训练一棵 IC 驱动的树并打印 OOS")
+print("8. RankICDiffCriterion：用同一份数据训练一棵 IC 驱动的树并打印 OOS")
 print("=" * 64)
 
 ic_engine = PanelTreeEngine(

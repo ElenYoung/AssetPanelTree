@@ -358,11 +358,28 @@ class TestWeightedR2MinChildWeight:
 
 class TestMosaicDefaults:
     def test_plot_mosaic_signature_has_center_and_rdbu(self):
+        """The mosaic plot must keep a ``center`` knob and default to
+        the diverging ``RdBu_r`` palette whenever the data contains
+        negative values (auto-detected when ``cmap=None``).
+        """
         import inspect
+        import numpy as np
 
         from ptree import MosaicVisualizer
+        from ptree.visualization import _UNSET
 
         sig = inspect.signature(MosaicVisualizer.plot_mosaic)
         params = sig.parameters
         assert "center" in params
-        assert params["cmap"].default == "RdBu_r"
+        # ``cmap`` is now auto-selected when left unset (None).  The
+        # divergent default for negative-containing data must still be
+        # ``RdBu_r`` so existing callers behave the same way.
+        assert params["cmap"].default is None
+        cmap, center = MosaicVisualizer._auto_cmap_and_center(
+            np.array([-0.1, 0.2, 0.3]),
+            metric=None, cmap=None, center=_UNSET,
+        )
+        assert cmap == "RdBu_r"
+        assert center == 0.0
+
+

@@ -6,7 +6,7 @@
 |------|---------|---------------------|
 | [`demo_ptree.py`](demo_ptree.py) | 单棵 P-Tree 的端到端用法：DataHandler、回归 / 波动率加权 / 分类、快速模式、节点报告、马赛克、叶子样本提取 | `demo_ptree_mosaic.png` |
 | [`demo_pforest.py`](demo_pforest.py) | PanelForest（时间块自助 + OOB）与 BoostedPanelTree（残差提升），含 Extra-Trees 风格变体与样本外 R² 对比 | （仅控制台输出） |
-| [`demo_visualization.py`](demo_visualization.py) | **v0.2 新功能**：`engine.evaluate` 逐节点 OOS、`print_tree` / `to_graphviz` 加 OOS 覆盖、`tune_ccp_alpha` 剪枝路径、`MosaicVisualizer` 默认 `RdBu_r`+`center=0.0`、`RankICDiffCriterion` 训练 | `tree_overlay.txt`、`tree_rank_ic_overlay.txt`、`tree.dot`、`node_eval.csv`、`ccp_alpha_sweep.{csv,png}`、`mosaic_leaf_mean.png`、`mosaic_r2.png` |
+| [`demo_visualization.py`](demo_visualization.py) | **v0.2 可视化**：`engine.evaluate` 逐节点 OOS；`print_tree` / `plot_tree`（纯 matplotlib）/ `to_graphviz` 加 OOS 覆盖；`tune_ccp_alpha` 剪枝路径；`MosaicVisualizer` 自动配色 + 支持 `metric="mean"` / `"ic"` / `"r2"` 等；`RankICDiffCriterion` 训练 | `tree_overlay.txt`、`tree_rank_ic_overlay.txt`、`tree.dot`、`tree.png`、`node_eval.csv`、`ccp_alpha_sweep.{csv,png}`、`mosaic_leaf_mean.png`、`mosaic_r2.png`、`mosaic_ic.png` |
 | [`benchmark.py`](benchmark.py) | 小型性能基准：朴素 vs 快速模式 vs Cython 加速对比 | （仅控制台输出） |
 
 ## 运行
