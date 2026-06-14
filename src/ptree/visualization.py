@@ -574,7 +574,9 @@ class NodeReporter:
         # distance, so the remaining ``row_h - box_h`` is *breathing room*
         # between parent and child – important once a tree gets a few
         # levels deep, otherwise the rendered nodes touch.
-        row_h = 1.7
+        row_h = 2.35
+
+
 
         positions: Dict[int, Tuple[float, float]] = {}
         depths: Dict[int, int] = {}
@@ -701,10 +703,13 @@ class NodeReporter:
         # pad each end by ~0.7 data-units for box halves + the legend strip.
         ax.set_ylim(-(max_depth * row_h + 0.9), 0.9)
 
-        # Box dimensions in *data coords* (one leaf = 1 x-unit).  A bit
-        # taller than before so the larger primary text has room.
+        # Box dimensions in *data coords* (one leaf = 1 x-unit).  Taller
+        # box than the default so each primary metric row gets more
+        # vertical room (i.e. more visible line spacing) — the inter-row
+        # ``step`` below is ``(box_h - …) / n_primary``.
         box_w = 0.94
-        box_h = 0.95
+        box_h = 1.30
+
 
 
 
