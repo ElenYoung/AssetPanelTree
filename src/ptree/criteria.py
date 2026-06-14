@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+
 
 
 class CriterionBase(ABC):
@@ -125,10 +126,17 @@ class WeightedR2DiffCriterion(CriterionBase):
         balance: bool = True,
         shrinkage_k: float = 0.0,
         use_adjusted_r2: bool = False,
+        min_child_weight: float = 0.0,
     ):
+        if not (0.0 <= min_child_weight < 0.5):
+            raise ValueError(
+                "min_child_weight must lie in [0, 0.5); got "
+                f"{min_child_weight!r}."
+            )
         self.balance = balance
         self.shrinkage_k = shrinkage_k
         self.use_adjusted_r2 = use_adjusted_r2
+        self.min_child_weight = min_child_weight
 
     @staticmethod
     def _adjusted_r2(r2: float, n: int, p: int) -> float:
@@ -146,6 +154,13 @@ class WeightedR2DiffCriterion(CriterionBase):
         r2_r = right_metrics.get("r2", 0.0)
         n_l = int(left_metrics.get("n_samples", 1))
         n_r = int(right_metrics.get("n_samples", 1))
+
+        # Hard floor on the smaller child's sample share — splits that produce
+        # a tiny sliver on either side score 0 and so are never selected.
+        if self.min_child_weight > 0.0:
+            total = max(n_l + n_r, 1)
+            if min(n_l, n_r) / total < self.min_child_weight:
+                return 0.0
 
         if self.use_adjusted_r2:
             p_l = int(left_metrics.get("n_features", 0))
@@ -171,8 +186,153 @@ class WeightedR2DiffCriterion(CriterionBase):
         return (
             f"WeightedR2DiffCriterion(balance={self.balance}, "
             f"shrinkage_k={self.shrinkage_k}, "
-            f"use_adjusted_r2={self.use_adjusted_r2})"
+            f"use_adjusted_r2={self.use_adjusted_r2}, "
+            f"min_child_weight={self.min_child_weight})"
         )
+
+
+# ======================================================================
+# Regression: Rank-IC difference (cross-sectional)
+# ======================================================================
+
+class RankICDiffCriterion(CriterionBase):
+    """Maximise the absolute difference in cross-sectional Rank-IC.
+
+    On low-signal-to-noise panels (e.g. monthly stock returns) ``|R^2_L -
+    R^2_R|`` is dominated by sum-of-squares variance and tends to over-reward
+    small high-variance child nodes.  The cross-sectional **Spearman rank IC**
+    — i.e. the mean per-time correlation between predicted and realised
+    rankings — is far more robust because it ignores scale and only measures
+    *ordering*.  This criterion therefore scores splits by
+
+    .. math::
+        \\text{score} = |\\overline{IC}_L - \\overline{IC}_R|,
+
+    optionally rescaled by the sample-balance factor used by
+    :class:`R2DiffCriterion`.
+
+    The engine attaches the per-time predicted/realised pairs to each child's
+    metrics under the non-scalar key ``"_rank_ic_series"`` (only populated
+    when ``MeanVarianceCriterion``-style time labels are available, i.e. a
+    ``time_index`` was passed to ``fit()``).  When the series is missing the
+    criterion falls back to a pre-computed scalar ``rank_ic`` value if
+    present, else returns ``0`` — i.e. it never raises, so it can be used
+    safely outside a time-aware build.
+
+    Parameters
+    ----------
+    balance : bool, default False
+        Multiply the IC difference by ``min(n_L, n_R) / (n_L + n_R)``.
+    min_child_weight : float, default 0.0
+        Sample-share floor on the smaller side; splits that produce a sliver
+        smaller than this fraction of ``n_L + n_R`` score ``0``.
+    min_periods : int, default 3
+        Minimum number of overlapping time periods required to estimate a
+        per-side IC; below this the side's IC defaults to ``0``.
+    """
+
+    def __init__(
+        self,
+        balance: bool = False,
+        min_child_weight: float = 0.0,
+        min_periods: int = 3,
+    ):
+        if not (0.0 <= min_child_weight < 0.5):
+            raise ValueError(
+                "min_child_weight must lie in [0, 0.5); got "
+                f"{min_child_weight!r}."
+            )
+        if min_periods < 1:
+            raise ValueError("min_periods must be >= 1.")
+        self.balance = balance
+        self.min_child_weight = min_child_weight
+        self.min_periods = min_periods
+
+    @staticmethod
+    def _ic_mean_from_series(series: Optional[Dict[Any, tuple]], min_periods: int) -> float:
+        """Compute mean cross-sectional Spearman IC over the per-time series.
+
+        ``series`` is the engine-attached payload: a dict ``{time: (y_true,
+        y_pred)}`` (both ndarray).  Returns ``0`` when fewer than
+        ``min_periods`` valid periods are available.
+        """
+        if not series:
+            return 0.0
+        ics: List[float] = []
+        for _, (yt, yp) in series.items():
+            yt = np.asarray(yt, dtype=np.float64)
+            yp = np.asarray(yp, dtype=np.float64)
+            if yt.size < 2:
+                continue
+            # Spearman = Pearson of ranks.  Average-rank tie handling.
+            rt = _rank_average(yt)
+            rp = _rank_average(yp)
+            if rt.std() < 1e-12 or rp.std() < 1e-12:
+                continue
+            ic = float(np.corrcoef(rt, rp)[0, 1])
+            if np.isfinite(ic):
+                ics.append(ic)
+        if len(ics) < min_periods:
+            return 0.0
+        return float(np.mean(ics))
+
+    def calculate_score(
+        self,
+        left_metrics: Dict[str, float],
+        right_metrics: Dict[str, float],
+    ) -> float:
+        n_l = int(left_metrics.get("n_samples", 1))
+        n_r = int(right_metrics.get("n_samples", 1))
+        if self.min_child_weight > 0.0:
+            total = max(n_l + n_r, 1)
+            if min(n_l, n_r) / total < self.min_child_weight:
+                return 0.0
+
+        # Prefer the per-time series payload; fall back to a pre-computed
+        # scalar ``rank_ic`` if a caller has supplied one.
+        sl = left_metrics.get("_rank_ic_series")
+        sr = right_metrics.get("_rank_ic_series")
+        if sl is not None or sr is not None:
+            ic_l = self._ic_mean_from_series(sl, self.min_periods)
+            ic_r = self._ic_mean_from_series(sr, self.min_periods)
+        else:
+            ic_l = float(left_metrics.get("rank_ic", 0.0))
+            ic_r = float(right_metrics.get("rank_ic", 0.0))
+
+        diff = abs(ic_l - ic_r)
+        if self.balance:
+            diff *= min(n_l, n_r) / max(n_l + n_r, 1)
+        return diff
+
+    def metric_key(self) -> str:
+        # Keep ``r2`` for node-level logging; the criterion operates on the
+        # non-scalar ``_rank_ic_series`` payload.
+        return "r2"
+
+    def __repr__(self) -> str:
+        return (
+            f"RankICDiffCriterion(balance={self.balance}, "
+            f"min_child_weight={self.min_child_weight}, "
+            f"min_periods={self.min_periods})"
+        )
+
+
+def _rank_average(x: np.ndarray) -> np.ndarray:
+    """Return average ranks (1-based) of *x* with tie-handling."""
+    order = np.argsort(x, kind="mergesort")
+    n = x.shape[0]
+    sorted_x = x[order]
+    is_group_start = np.empty(n, dtype=bool)
+    is_group_start[0] = True
+    np.not_equal(sorted_x[1:], sorted_x[:-1], out=is_group_start[1:])
+    group_id = np.cumsum(is_group_start) - 1
+    group_starts = np.flatnonzero(is_group_start)
+    group_ends = np.append(group_starts[1:], n)
+    group_avg_rank = 0.5 * (group_starts + group_ends - 1) + 1.0
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = group_avg_rank[group_id]
+    return ranks
+
 
 
 # ======================================================================
