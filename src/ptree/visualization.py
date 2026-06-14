@@ -804,18 +804,23 @@ class NodeReporter:
             avail = primary_top - primary_bottom
             n_primary = max(len(primary), 1)
             step = avail / n_primary
+            # Internal nodes carry one extra primary row (Δcriterion), so
+            # their text gets a slightly smaller font to avoid crowding the
+            # box vertically.  Leaves keep the larger size.
+            primary_fontsize = 9.5 if not node.is_leaf else 10.5
             for i, txt in enumerate(primary):
                 ax.text(
                     x,
                     primary_top - step * (i + 0.5),
                     txt,
-                    fontsize=10.5,
+                    fontsize=primary_fontsize,
                     fontweight="semibold",
                     color=text_color,
                     ha="center",
                     va="center",
                     zorder=4,
                 )
+
 
 
         # ---- 6. Title + legend --------------------------------------
