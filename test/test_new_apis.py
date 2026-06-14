@@ -89,7 +89,7 @@ def fitted_engine(panel_data):
 
 
 def test_version_is_v2():
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.2.1"
 
 
 def test_new_exports_present():

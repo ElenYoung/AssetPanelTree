@@ -23,7 +23,7 @@ class TestImports:
     """Test that all public API imports work correctly."""
 
     def test_version(self):
-        assert __version__ == "0.2.0"
+        assert __version__ == "0.2.1"
 
     def test_all_classes_importable(self):
         assert DataHandler is not None
