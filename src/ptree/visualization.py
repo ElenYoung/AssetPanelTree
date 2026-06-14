@@ -86,12 +86,41 @@ def _apply_mpl_style() -> None:
     )
 
 
-def _format_float(v: float, digits: int = 4, signed: bool = False) -> str:
+# All numeric values rendered by this module are clipped to three decimal
+# places — finer precision is misleading on noisy financial panels and the
+# extra digits add visual clutter to node boxes / heatmap annotations.
+_DEC = 3
+
+
+def _format_float(v: float, digits: int = _DEC, signed: bool = False) -> str:
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
     if signed:
         return f"{v:+.{digits}f}"
     return f"{v:.{digits}f}"
+
+
+def _crit_metric_key(engine) -> Optional[str]:
+    """Return the criterion's primary metric key (e.g. ``"r2"``).
+
+    Defensive against engines fitted with a custom criterion that doesn't
+    expose ``metric_key()`` – we simply fall back to ``"r2"``.
+    """
+    crit = getattr(engine, "criterion", None)
+    if crit is None:
+        return "r2"
+    try:
+        key = crit.metric_key()
+    except Exception:  # pragma: no cover - defensive
+        return "r2"
+    return key or "r2"
+
+
+def _crit_metric_display(engine) -> str:
+    """Return a human-readable symbol for the criterion's primary metric."""
+    key = _crit_metric_key(engine)
+    return _METRIC_DISPLAY.get(key, key.upper() if key else "metric")
+
 
 
 # ======================================================================
@@ -215,8 +244,9 @@ class NodeReporter:
             if isinstance(v, float):
                 if not np.isfinite(v):
                     continue
-                parts.append(f"{_METRIC_DISPLAY.get(k, k)}={v:.4f}")
+                parts.append(f"{_METRIC_DISPLAY.get(k, k)}={v:.{_DEC}f}")
             elif isinstance(v, (int, np.integer)):
+
                 parts.append(f"{_METRIC_DISPLAY.get(k, k)}={int(v)}")
         return ", ".join(parts)
 
@@ -228,15 +258,16 @@ class NodeReporter:
         if n_oos is not None and not pd.isna(n_oos):
             bits.append(f"n_oos={int(n_oos)}")
         if "oos_r2" in row and not pd.isna(row["oos_r2"]):
-            bits.append(f"OOS R²={row['oos_r2']:+.4f}")
+            bits.append(f"OOS R²={row['oos_r2']:+.{_DEC}f}")
         if "oos_rank_ic_mean" in row and not pd.isna(row["oos_rank_ic_mean"]):
             ir = row.get("oos_rank_ic_ir", float("nan"))
             if not pd.isna(ir):
                 bits.append(
-                    f"OOS IC={row['oos_rank_ic_mean']:+.4f} (IR={ir:+.2f})"
+                    f"OOS IC={row['oos_rank_ic_mean']:+.{_DEC}f} "
+                    f"(IR={ir:+.{_DEC}f})"
                 )
             else:
-                bits.append(f"OOS IC={row['oos_rank_ic_mean']:+.4f}")
+                bits.append(f"OOS IC={row['oos_rank_ic_mean']:+.{_DEC}f}")
         return " | ".join(bits)
 
     @staticmethod
@@ -247,15 +278,15 @@ class NodeReporter:
             l = row.get("left_oos_r2", float("nan"))
             r = row.get("right_oos_r2", float("nan"))
             bits.append(
-                f"ΔR²={row['delta_oos_r2']:+.4f} "
-                f"(L={l:+.4f} vs R={r:+.4f})"
+                f"ΔR²={row['delta_oos_r2']:+.{_DEC}f} "
+                f"(L={l:+.{_DEC}f} vs R={r:+.{_DEC}f})"
             )
         if "delta_oos_rank_ic" in row and not pd.isna(row["delta_oos_rank_ic"]):
             l = row.get("left_oos_rank_ic_mean", float("nan"))
             r = row.get("right_oos_rank_ic_mean", float("nan"))
             bits.append(
-                f"ΔIC={row['delta_oos_rank_ic']:+.4f} "
-                f"(L={l:+.4f} vs R={r:+.4f})"
+                f"ΔIC={row['delta_oos_rank_ic']:+.{_DEC}f} "
+                f"(L={l:+.{_DEC}f} vs R={r:+.{_DEC}f})"
             )
         return " | ".join(bits)
 
@@ -280,7 +311,7 @@ class NodeReporter:
             label = (
                 f"[Node {node.node_id}] "
                 f"{node.split_feature} < {node.split_threshold:g} | "
-                f"n={node.n_samples}, gain={node.split_score:.4f}"
+                f"n={node.n_samples}, gain={node.split_score:.{_DEC}f}"
             )
             if metric_str:
                 label = f"{label} | {metric_str}"
@@ -395,7 +426,7 @@ class NodeReporter:
                 rows.append(f"<TR><TD>{rule}</TD></TR>")
                 rows.append(
                     f"<TR><TD>n={node.n_samples}, "
-                    f"gain={node.split_score:.4f}</TD></TR>"
+                    f"gain={node.split_score:.{_DEC}f}</TD></TR>"
                 )
             else:
                 rows.append(f"<TR><TD>n={node.n_samples}</TD></TR>")
@@ -513,7 +544,31 @@ class NodeReporter:
             df = evaluation.per_node_df.set_index("node_id")
             eval_lookup = df.to_dict(orient="index")
 
+        # Resolve the criterion's primary metric so the boxes emphasise
+        # *that* metric (R², IC, precision, …) rather than always R².
+        crit_key = _crit_metric_key(self.engine)
+        crit_disp = _crit_metric_display(self.engine)
+
+        # Map crit_key → (IS key in node.metrics, OOS col, Δ col).
+        # The engine currently emits OOS columns only for r2 / rank_ic;
+        # for other criteria we fall back to the IS metric alone.
+        _METRIC_AXIS = {
+            "r2": ("r2", "oos_r2", "delta_oos_r2"),
+            "rank_ic": ("rank_ic_mean", "oos_rank_ic_mean",
+                        "delta_oos_rank_ic"),
+            "rank_ic_mean": ("rank_ic_mean", "oos_rank_ic_mean",
+                             "delta_oos_rank_ic"),
+            "precision": ("precision", None, None),
+            "f1": ("f1", None, None),
+            "auc": ("auc", None, None),
+            "logloss": ("logloss", None, None),
+        }
+        is_key, oos_col, delta_col = _METRIC_AXIS.get(
+            crit_key, ("r2", "oos_r2", "delta_oos_r2")
+        )
+
         # ---- 1. Layout: compute (x, y) for every node ---------------
+
         positions: Dict[int, Tuple[float, float]] = {}
         depths: Dict[int, int] = {}
         leaf_counter = [0]
@@ -539,51 +594,97 @@ class NodeReporter:
         n_leaves = max(leaf_counter[0], 1)
 
         # ---- 2. Compose multi-row label text -------------------------
-        def _box_lines(node) -> List[str]:
-            head = (
-                f"Leaf {node.node_id}" if node.is_leaf
+        # Each node box renders as
+        #   header (bold)
+        #   [secondary]   (split rule – internal only)
+        #   primary 1     (n = …)
+        #   primary 2     (IS criterion metric)
+        #   primary 3     (OOS criterion metric  OR  Δcriterion)
+        # Primary lines get a larger, bolder font so the eye sees the
+        # *important* numbers first; secondary lines (split rule) stay
+        # small and grey.
+        def _box_payload(node):
+            is_leaf = node.is_leaf
+            header = (
+                f"Leaf {node.node_id}" if is_leaf
                 else f"Node {node.node_id}"
             )
-            lines = [head]
-            if not node.is_leaf:
-                lines.append(
+            secondary: List[str] = []
+            primary: List[str] = []
+
+            if not is_leaf:
+                secondary.append(
                     f"{node.split_feature} < {node.split_threshold:g}"
                 )
-                lines.append(
-                    f"n={node.n_samples}  gain={node.split_score:.4f}"
+
+            # n is always primary.
+            primary.append(f"n = {node.n_samples}")
+
+            # IS criterion metric.
+            is_val = node.metrics.get(is_key)
+            # ``rank_ic_mean`` sometimes lives under ``rank_ic``.
+            if is_val is None and is_key == "rank_ic_mean":
+                is_val = node.metrics.get("rank_ic")
+            if (
+                isinstance(is_val, (int, float))
+                and np.isfinite(float(is_val))
+            ):
+                primary.append(
+                    f"IS {crit_disp} = {float(is_val):+.{_DEC}f}"
                 )
-            else:
-                lines.append(f"n={node.n_samples}")
-            metric_str = self._format_metrics(node.metrics, include=metric_keys)
-            if metric_str:
-                lines.append(metric_str)
+
+            # OOS column for leaves; Δ for internals (if available).
             if eval_lookup is not None and node.node_id in eval_lookup:
                 row = eval_lookup[node.node_id]
-                oos = self._format_eval_row(row)
-                if oos:
-                    lines.append(oos)
-                if show_child_diff and not node.is_leaf:
-                    diff = self._format_child_diff_row(row)
-                    if diff:
-                        lines.append(diff)
-            return lines
+                if is_leaf:
+                    if oos_col is not None and oos_col in row:
+                        v = row[oos_col]
+                        if v is not None and not pd.isna(v):
+                            primary.append(
+                                f"OOS {crit_disp} = {float(v):+.{_DEC}f}"
+                            )
+                else:
+                    # OOS metric of the node itself.
+                    if oos_col is not None and oos_col in row:
+                        v = row[oos_col]
+                        if v is not None and not pd.isna(v):
+                            primary.append(
+                                f"OOS {crit_disp} = {float(v):+.{_DEC}f}"
+                            )
+                    # ΔR² / ΔIC across children — the key driver of the split.
+                    if (
+                        show_child_diff
+                        and delta_col is not None
+                        and delta_col in row
+                    ):
+                        d = row[delta_col]
+                        if d is not None and not pd.isna(d):
+                            primary.append(
+                                f"Δ{crit_disp} = {float(d):+.{_DEC}f}"
+                            )
 
-        node_texts = {n: _box_lines(node) for n, node in self._iter_nodes()}
+            return header, secondary, primary
+
+        node_payloads = {
+            n: _box_payload(node) for n, node in self._iter_nodes()
+        }
 
         # ---- 3. Figure size heuristics ------------------------------
         if figsize is None:
-            width = max(8.0, 1.6 * n_leaves)
-            height = max(4.0, 1.6 * (max_depth + 1))
+            width = max(8.0, 1.7 * n_leaves)
+            height = max(4.5, 1.85 * (max_depth + 1))
             figsize = (width, height)
 
         fig, ax = plt.subplots(figsize=figsize)
         ax.set_axis_off()
         ax.set_xlim(-1.0, n_leaves)
-        ax.set_ylim(-(max_depth + 0.8), 0.8)
+        ax.set_ylim(-(max_depth + 0.9), 0.9)
 
-        # Box dimensions in *data coords* (one leaf = 1 x-unit).
-        box_w = 0.92
-        box_h = 0.78
+        # Box dimensions in *data coords* (one leaf = 1 x-unit).  A bit
+        # taller than before so the larger primary text has room.
+        box_w = 0.94
+        box_h = 0.95
+
 
         # ---- 4. Draw edges first so boxes overlay them --------------
         for node_id, node in self._iter_nodes():
@@ -625,6 +726,12 @@ class NodeReporter:
                 )
 
         # ---- 5. Draw boxes + text ----------------------------------
+        # Vertical layout inside each box (in box-relative offsets from top):
+        #   header       ~0.13          (bold, 11pt, in fill colour)
+        #   secondary    ~0.30          (8pt, grey, italic) – split rule
+        #   primary 0..k evenly spaced  (10.5pt, semibold, dark)
+        # Internal nodes carry an extra "secondary" row (split rule); leaves
+        # don't, so primary content gets more vertical room.
         for node_id, node in self._iter_nodes():
             x, y = positions[node_id]
             fill = leaf_color if node.is_leaf else node_color
@@ -632,37 +739,62 @@ class NodeReporter:
                 (x - box_w / 2, y - box_h / 2),
                 box_w, box_h,
                 boxstyle="round,pad=0.02,rounding_size=0.08",
-                linewidth=1.2,
+                linewidth=1.4,
                 edgecolor=fill,
                 facecolor=fill + "33",  # 20% alpha hex
                 zorder=3,
             )
             ax.add_patch(patch)
 
-            lines = node_texts[node_id]
-            # First line is the header (bold).
+            header, secondary, primary = node_payloads[node_id]
+            top_y = y + box_h / 2
+
+            # Header (bold, fill colour).
             ax.text(
-                x, y + box_h / 2 - 0.12,
-                lines[0],
-                fontsize=9,
+                x, top_y - 0.10,
+                header,
+                fontsize=11,
                 fontweight="bold",
                 color=fill,
                 ha="center",
                 va="top",
                 zorder=4,
             )
-            # Subsequent lines, regular weight.
-            line_h = (box_h - 0.22) / max(len(lines) - 1, 1)
-            for i, txt in enumerate(lines[1:], start=1):
+
+            # Secondary line (split rule).
+            sec_consumed = 0.0
+            if secondary:
                 ax.text(
-                    x, y + box_h / 2 - 0.22 - (i - 1) * line_h - line_h * 0.5,
+                    x, top_y - 0.28,
+                    secondary[0],
+                    fontsize=8,
+                    style="italic",
+                    color="#5B6B7B",
+                    ha="center",
+                    va="top",
+                    zorder=4,
+                )
+                sec_consumed = 0.18
+
+            # Primary rows: take whatever vertical room remains.
+            primary_top = top_y - 0.32 - sec_consumed
+            primary_bottom = y - box_h / 2 + 0.08
+            avail = primary_top - primary_bottom
+            n_primary = max(len(primary), 1)
+            step = avail / n_primary
+            for i, txt in enumerate(primary):
+                ax.text(
+                    x,
+                    primary_top - step * (i + 0.5),
                     txt,
-                    fontsize=7.5,
+                    fontsize=10.5,
+                    fontweight="semibold",
                     color=text_color,
                     ha="center",
                     va="center",
                     zorder=4,
                 )
+
 
         # ---- 6. Title + legend --------------------------------------
         ax.set_title(title)
@@ -1021,7 +1153,7 @@ class MosaicVisualizer:
             yticklabels=[f"Leaf {lid}" for lid in mosaic.index],
             cbar_kws={"label": cbar_label, "shrink": 0.85, "pad": 0.02},
             annot=annotate,
-            fmt=".2f" if annotate else "",
+            fmt=f".{_DEC}f" if annotate else "",
         )
 
         ax.set_title(title)
