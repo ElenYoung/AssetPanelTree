@@ -78,6 +78,17 @@ class PanelTreeNode:
     # during prediction).  Populated by the engine after a split is chosen.
     _split_feature_idx: Optional[int] = field(default=None, repr=False)
 
+    # Persisted sample-count cache.  ``sample_indices`` may be stripped before
+    # pickling (or for memory reasons) — this field survives that strip so
+    # downstream code can keep using ``node.n_samples`` as the single source
+    # of truth rather than the ad-hoc ``metrics['n_samples']`` fallback.
+    _n_samples_cached: Optional[int] = field(default=None, repr=False)
+    # Honest-mode: when the engine was fitted with ``honest=True``, this is
+    # the size of the *evaluation* (held-out) subset that scored each split.
+    # ``None`` for non-honest trees or non-internal nodes that were not
+    # involved in honest evaluation.
+    honest_n_samples: Optional[int] = field(default=None, repr=False)
+
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -85,8 +96,22 @@ class PanelTreeNode:
 
     @property
     def n_samples(self) -> int:
+        """Number of training samples in this node.
+
+        Resolution order (single source of truth):
+
+        1. The current ``sample_indices`` length, if still attached.
+        2. The cached ``_n_samples_cached`` value (survives index stripping).
+        3. The legacy ``metrics['n_samples']`` value (older pickles).
+        4. ``0`` if nothing is available.
+        """
         if self.sample_indices is not None:
             return len(self.sample_indices)
+        if self._n_samples_cached is not None:
+            return int(self._n_samples_cached)
+        legacy = self.metrics.get("n_samples")
+        if legacy is not None:
+            return int(legacy)
         return 0
 
     def get_model_weights(self) -> Optional[np.ndarray]:
