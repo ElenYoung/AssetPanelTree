@@ -8,13 +8,14 @@ Visualization and reporting utilities for PanelTree.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 
 import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
-    from ptree.engine import PanelTreeEngine
+    from ptree.engine import NodeEvalResult, PanelTreeEngine
+
 
 logger = logging.getLogger("ptree")
 
@@ -52,19 +53,49 @@ class NodeReporter:
         df = self.summary()
         return df[df["Is_Leaf"]].reset_index(drop=True)
 
-    def print_tree(self, node=None) -> str:
+    def print_tree(
+        self,
+        node=None,
+        evaluation: Optional["NodeEvalResult"] = None,
+        show_child_diff: bool = False,
+    ) -> str:
         """Return a text representation of the tree structure.
 
         Uses box-drawing characters (``│``, ``├──``, ``└──``) with
         continuous vertical lines so that sibling relationships remain
         visible even in deep trees.  Both internal and leaf nodes display
         their evaluation metrics.
+
+        Parameters
+        ----------
+        node : PanelTreeNode, optional
+            Subtree root to start from; defaults to the engine's root.
+        evaluation : NodeEvalResult, optional
+            Output of :meth:`PanelTreeEngine.evaluate`.  When supplied,
+            each node's line is augmented with OOS metrics
+            (``oos_r2``, ``oos_rank_ic_mean`` / ``IR``, ``n_oos``).
+        show_child_diff : bool, default False
+            When ``True`` *and* ``evaluation`` is supplied, an extra
+            ``↳ L vs R | ΔR²=…  ΔIC=…`` line is inserted under every
+            internal node, surfacing whether the split actually opened a
+            predictability gap between its children.
         """
         if node is None:
             node = self.engine.root_
+
+        eval_lookup: Optional[Dict[int, Dict[str, Any]]] = None
+        if evaluation is not None:
+            df = evaluation.per_node_df.set_index("node_id")
+            eval_lookup = df.to_dict(orient="index")
+
         lines: List[str] = []
-        self._print_recursive(node, "", "", lines)
+        self._print_recursive(
+            node, "", "", lines,
+            eval_lookup=eval_lookup,
+            show_child_diff=show_child_diff,
+        )
         return "\n".join(lines)
+
 
     @staticmethod
     def _format_metrics(metrics: Dict, exclude: Optional[set] = None) -> str:
@@ -80,12 +111,51 @@ class NodeReporter:
                 parts.append(f"{k}={v}")
         return ", ".join(parts)
 
+    @staticmethod
+    def _format_eval_row(row: Dict[str, Any]) -> str:
+        """Format the OOS columns of a NodeEvalResult row into one suffix."""
+        bits: List[str] = []
+        n_oos = row.get("n_oos")
+        if n_oos is not None and not pd.isna(n_oos):
+            bits.append(f"n_oos={int(n_oos)}")
+        if "oos_r2" in row and not pd.isna(row["oos_r2"]):
+            bits.append(f"oos_r2={row['oos_r2']:+.4f}")
+        if "oos_rank_ic_mean" in row and not pd.isna(row["oos_rank_ic_mean"]):
+            ir = row.get("oos_rank_ic_ir", float("nan"))
+            if not pd.isna(ir):
+                bits.append(
+                    f"ic={row['oos_rank_ic_mean']:+.4f} (IR={ir:+.2f})"
+                )
+            else:
+                bits.append(f"ic={row['oos_rank_ic_mean']:+.4f}")
+        return " | ".join(bits)
+
+    @staticmethod
+    def _format_child_diff_row(row: Dict[str, Any]) -> str:
+        """Format the ΔR² / ΔIC summary line for an internal node."""
+        bits: List[str] = []
+        if "delta_oos_r2" in row and not pd.isna(row["delta_oos_r2"]):
+            l = row.get("left_oos_r2", float("nan"))
+            r = row.get("right_oos_r2", float("nan"))
+            bits.append(
+                f"ΔR²={row['delta_oos_r2']:+.4f} ({l:+.4f} vs {r:+.4f})"
+            )
+        if "delta_oos_rank_ic" in row and not pd.isna(row["delta_oos_rank_ic"]):
+            l = row.get("left_oos_rank_ic_mean", float("nan"))
+            r = row.get("right_oos_rank_ic_mean", float("nan"))
+            bits.append(
+                f"ΔIC={row['delta_oos_rank_ic']:+.4f} ({l:+.4f} vs {r:+.4f})"
+            )
+        return " | ".join(bits)
+
     def _print_recursive(
         self,
         node,
         prefix: str,
         connector: str,
         lines: List[str],
+        eval_lookup: Optional[Dict[int, Dict[str, Any]]] = None,
+        show_child_diff: bool = False,
     ) -> None:
         """Recursively build tree-drawing lines.
 
@@ -97,6 +167,8 @@ class NodeReporter:
         connector : str
             ``""`` for the root, ``"├── "`` for non-last children,
             ``"└── "`` for the last child.
+        eval_lookup, show_child_diff
+            Optional OOS overlay; see :meth:`print_tree`.
         """
         metric_str = self._format_metrics(node.metrics)
 
@@ -113,6 +185,12 @@ class NodeReporter:
                 f"(Δ={node.split_score:.4f})"
             )
 
+        # OOS suffix (if an evaluation was supplied).
+        if eval_lookup is not None and node.node_id in eval_lookup:
+            suffix = self._format_eval_row(eval_lookup[node.node_id])
+            if suffix:
+                label = f"{label} | {suffix}"
+
         lines.append(f"{prefix}{connector}{label}")
 
         if not node.is_leaf:
@@ -127,6 +205,16 @@ class NodeReporter:
                 # Root node – no extra prefix
                 child_prefix = prefix
 
+            # Optional ΔR² / ΔIC summary line under the node.
+            if (
+                show_child_diff
+                and eval_lookup is not None
+                and node.node_id in eval_lookup
+            ):
+                diff_str = self._format_child_diff_row(eval_lookup[node.node_id])
+                if diff_str:
+                    lines.append(f"{child_prefix}↳ L vs R | {diff_str}")
+
             children = []
             if node.left is not None:
                 children.append(node.left)
@@ -138,7 +226,106 @@ class NodeReporter:
                 child_connector = "└── " if is_last else "├── "
                 self._print_recursive(
                     child, child_prefix, child_connector, lines,
+                    eval_lookup=eval_lookup,
+                    show_child_diff=show_child_diff,
                 )
+
+    # ------------------------------------------------------------------
+    # Graphviz export
+    # ------------------------------------------------------------------
+
+    def to_graphviz(
+        self,
+        evaluation: Optional["NodeEvalResult"] = None,
+        show_child_diff: bool = False,
+        leaf_fill: str = "#cfe8d6",
+        node_fill: str = "#dceaf7",
+    ) -> str:
+        """Return a Graphviz DOT representation of the fitted tree.
+
+        Renderable with ``graphviz``::
+
+            from graphviz import Source
+            Source(NodeReporter(engine).to_graphviz()).render('tree')
+
+        Parameters
+        ----------
+        evaluation : NodeEvalResult, optional
+            When supplied, OOS metrics from :meth:`PanelTreeEngine.evaluate`
+            are appended to each node's label (same conventions as
+            :meth:`print_tree`).
+        show_child_diff : bool, default False
+            Add a ``ΔR² / ΔIC`` summary line under every internal node label.
+        leaf_fill, node_fill : str
+            Hex / named colour for leaf and internal node fill.
+
+        Returns
+        -------
+        dot : str
+            DOT source — no Graphviz binary or python ``graphviz``
+            package is required just to obtain the source string.
+        """
+        assert self.engine.root_ is not None, "Engine not fitted."
+
+        eval_lookup: Optional[Dict[int, Dict[str, Any]]] = None
+        if evaluation is not None:
+            df = evaluation.per_node_df.set_index("node_id")
+            eval_lookup = df.to_dict(orient="index")
+
+        lines: List[str] = [
+            "digraph PanelTree {",
+            "  graph [rankdir=TB, fontname=\"Helvetica\"];",
+            "  node  [shape=box, style=\"rounded,filled\", "
+            "fontname=\"Helvetica\"];",
+            "  edge  [fontname=\"Helvetica\"];",
+        ]
+
+        def _node_label(node) -> str:
+            metric_str = self._format_metrics(node.metrics)
+            if node.is_leaf:
+                head = f"Leaf {node.node_id}\\nn={node.n_samples}"
+            else:
+                head = (
+                    f"Node {node.node_id}\\n"
+                    f"{node.split_feature} < {node.split_threshold}\\n"
+                    f"n={node.n_samples}, Δ={node.split_score:.4f}"
+                )
+            label = f"{head}\\n{metric_str}" if metric_str else head
+            if eval_lookup is not None and node.node_id in eval_lookup:
+                suffix = self._format_eval_row(eval_lookup[node.node_id])
+                if suffix:
+                    label = f"{label}\\n{suffix}"
+                if show_child_diff and not node.is_leaf:
+                    diff = self._format_child_diff_row(
+                        eval_lookup[node.node_id]
+                    )
+                    if diff:
+                        label = f"{label}\\nL vs R: {diff}"
+            return label.replace('"', r"\"")
+
+        def _walk(node) -> None:
+            fill = leaf_fill if node.is_leaf else node_fill
+            lines.append(
+                f"  n{node.node_id} ["
+                f"label=\"{_node_label(node)}\", fillcolor=\"{fill}\"];"
+            )
+            if node.left is not None:
+                lines.append(
+                    f"  n{node.node_id} -> n{node.left.node_id} "
+                    f"[label=\"< {node.split_threshold}\"];"
+                )
+                _walk(node.left)
+            if node.right is not None:
+                lines.append(
+                    f"  n{node.node_id} -> n{node.right.node_id} "
+                    f"[label=\">= {node.split_threshold}\"];"
+                )
+                _walk(node.right)
+
+        _walk(self.engine.root_)
+        lines.append("}")
+        return "\n".join(lines)
+
 
 
 # ======================================================================
@@ -245,13 +432,32 @@ class MosaicVisualizer:
         self,
         mosaic: pd.DataFrame,
         title: str = "Prediction Mosaic",
-        cmap: str = "RdYlGn",
+        cmap: str = "RdBu_r",
+        center: Optional[float] = 0.0,
         figsize: tuple = (14, 6),
         save_path: Optional[str] = None,
     ):
         """Plot the mosaic as a heatmap.
 
         Requires ``matplotlib`` and ``seaborn``.
+
+        Parameters
+        ----------
+        mosaic : DataFrame
+            Output of :meth:`build_mosaic`.
+        title : str
+            Figure title.
+        cmap : str, default ``"RdBu_r"``
+            Matplotlib / seaborn colormap.  The default ``"RdBu_r"`` is
+            colour-blind safe and uses the *finance-positive-is-red*
+            convention (replaces the previous ``"RdYlGn"`` default).
+        center : float or None, default 0.0
+            Value at which the colormap centres.  Pass ``None`` to disable
+            centering (useful for one-sided metrics like raw |IC|).
+        figsize : tuple
+            Matplotlib figure size in inches.
+        save_path : str, optional
+            If given, the figure is also written to this path.
         """
         import matplotlib.pyplot as plt
         import seaborn as sns
@@ -260,12 +466,13 @@ class MosaicVisualizer:
         sns.heatmap(
             mosaic.astype(float),
             cmap=cmap,
-            center=0,
+            center=center,
             ax=ax,
             linewidths=0.5,
             xticklabels=True,
             yticklabels=True,
         )
+
         ax.set_title(title)
         ax.set_xlabel(mosaic.columns.name or "Time")
         ax.set_ylabel("Leaf Node")
