@@ -568,6 +568,13 @@ class NodeReporter:
         )
 
         # ---- 1. Layout: compute (x, y) for every node ---------------
+        #
+        # ``row_h`` is the vertical distance (in data coords) between two
+        # successive depth levels.  Boxes occupy at most ``box_h`` of that
+        # distance, so the remaining ``row_h - box_h`` is *breathing room*
+        # between parent and child – important once a tree gets a few
+        # levels deep, otherwise the rendered nodes touch.
+        row_h = 1.7
 
         positions: Dict[int, Tuple[float, float]] = {}
         depths: Dict[int, int] = {}
@@ -578,7 +585,7 @@ class NodeReporter:
             if node.is_leaf or (node.left is None and node.right is None):
                 x = float(leaf_counter[0])
                 leaf_counter[0] += 1
-                positions[node.node_id] = (x, -float(depth))
+                positions[node.node_id] = (x, -float(depth) * row_h)
                 return x
             xs = []
             if node.left is not None:
@@ -586,12 +593,13 @@ class NodeReporter:
             if node.right is not None:
                 xs.append(_layout(node.right, depth + 1))
             x = sum(xs) / len(xs)
-            positions[node.node_id] = (x, -float(depth))
+            positions[node.node_id] = (x, -float(depth) * row_h)
             return x
 
         _layout(self.engine.root_, 0)
         max_depth = max(depths.values()) if depths else 0
         n_leaves = max(leaf_counter[0], 1)
+
 
         # ---- 2. Compose multi-row label text -------------------------
         # Each node box renders as
@@ -670,20 +678,34 @@ class NodeReporter:
         }
 
         # ---- 3. Figure size heuristics ------------------------------
+        # Width grows with the leaf count; height grows with depth × row_h
+        # so each successive level keeps the same vertical breathing room
+        # regardless of how many leaves the tree has.  The 1.05× factor
+        # on the per-row inch budget produces ~1.6 in per depth level –
+        # comfortable for the 0.95-tall boxes plus ≥0.55 of edge space.
         if figsize is None:
             width = max(8.0, 1.7 * n_leaves)
-            height = max(4.5, 1.85 * (max_depth + 1))
+            # Each depth level needs ~``row_h`` data-units → multiply by
+            # an inches-per-data-unit factor; add a small margin top/bot.
+            inches_per_row = 1.05
+            height = max(
+                4.5,
+                inches_per_row * row_h * (max_depth + 1) + 1.2,
+            )
             figsize = (width, height)
 
         fig, ax = plt.subplots(figsize=figsize)
         ax.set_axis_off()
         ax.set_xlim(-1.0, n_leaves)
-        ax.set_ylim(-(max_depth + 0.9), 0.9)
+        # y ranges from 0 (root) down to -max_depth * row_h (deepest level);
+        # pad each end by ~0.7 data-units for box halves + the legend strip.
+        ax.set_ylim(-(max_depth * row_h + 0.9), 0.9)
 
         # Box dimensions in *data coords* (one leaf = 1 x-unit).  A bit
         # taller than before so the larger primary text has room.
         box_w = 0.94
         box_h = 0.95
+
 
 
         # ---- 4. Draw edges first so boxes overlay them --------------
