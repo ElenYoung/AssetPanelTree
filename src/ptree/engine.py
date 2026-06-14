@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
     Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -55,6 +57,49 @@ from ptree.criteria import (
 
 
 logger = logging.getLogger("ptree")
+
+
+# ======================================================================
+# Node-level OOS evaluation result container
+# ======================================================================
+
+
+@dataclass
+class NodeEvalResult:
+    """Structured result of :meth:`PanelTreeEngine.evaluate`.
+
+    Attributes
+    ----------
+    per_node_df : pd.DataFrame
+        One row per node (BFS order) with columns
+        ``node_id, depth, is_leaf, split_feature, split_threshold,
+        n_oos, train_r2, oos_r2, oos_rank_ic_mean, oos_rank_ic_ir,
+        left_oos_r2, right_oos_r2, delta_oos_r2,
+        left_oos_rank_ic_mean, right_oos_rank_ic_mean, delta_oos_rank_ic``.
+        Internal-node aggregate metrics are computed by *merging* the
+        left and right child evaluation pools (so leaf and internal
+        rows are directly comparable).
+    per_node_metrics : Dict[int, Dict[str, float]]
+        ``node_id -> {metric_name: value}`` mapping (raw numbers, no
+        rounding) for programmatic access.
+    leaf_assignments : np.ndarray
+        Leaf ``node_id`` each input row was routed to (shape ``(n,)``).
+    metrics : Tuple[str, ...]
+        Metrics that were actually computed (a subset of the requested
+        ``metrics`` argument; ``rank_ic`` is dropped when no time labels
+        were provided).
+    """
+
+    per_node_df: pd.DataFrame
+    per_node_metrics: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    leaf_assignments: Optional[np.ndarray] = None
+    metrics: Tuple[str, ...] = ()
+
+    def __repr__(self) -> str:
+        n_nodes = len(self.per_node_df)
+        return (
+            f"NodeEvalResult(n_nodes={n_nodes}, metrics={list(self.metrics)})"
+        )
 
 
 # ======================================================================
@@ -349,8 +394,412 @@ class PanelTreeEngine:
         return {leaf.node_id: leaf.sample_indices for leaf in self.get_leaves()}
 
     # ------------------------------------------------------------------
+    # Leaf / node routing (Public API)
+    # ------------------------------------------------------------------
+
+    def predict_leaves(self, X: pd.DataFrame) -> np.ndarray:
+        """Route each row of *X* to its terminal leaf and return the leaf ids.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Must contain the feature columns used during ``fit``.
+
+        Returns
+        -------
+        leaf_ids : ndarray of shape (n,)
+            ``leaf_ids[i]`` is the ``node_id`` of the leaf into which row
+            ``i`` of ``X`` falls.
+
+        Notes
+        -----
+        This is the public counterpart of the previously-private
+        ``_assign_leaf_ids`` helper used internally by
+        :meth:`build_sdf_factor` and :class:`MosaicVisualizer`.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        X_arr = X[self._feature_names].values.astype(np.float64)
+        out = np.empty(X_arr.shape[0], dtype=np.int64)
+        self._assign_leaf_ids(
+            self.root_, X_arr, np.arange(X_arr.shape[0]), out
+        )
+        return out
+
+    def predict_node_path(self, X: pd.DataFrame) -> List[List[int]]:
+        """Return the root-to-leaf node-id path each row of *X* traverses.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Must contain the feature columns used during ``fit``.
+
+        Returns
+        -------
+        paths : list of list of int
+            ``paths[i]`` is the ordered list of ``node_id`` from the root to
+            the leaf for row ``i``.  Useful for diagnostics ("which decision
+            chain produced this prediction?") and for building per-internal
+            -node OOS evaluation pools.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        X_arr = X[self._feature_names].values.astype(np.float64)
+        n = X_arr.shape[0]
+        paths: List[List[int]] = [[] for _ in range(n)]
+
+        def _walk(node: PanelTreeNode, row_idx: np.ndarray) -> None:
+            for i in row_idx:
+                paths[int(i)].append(node.node_id)
+            if node.is_leaf:
+                return
+            feat_idx = node._split_feature_idx
+            if feat_idx is None:
+                feat_idx = self._feature_names.index(node.split_feature)
+            vals = X_arr[row_idx, feat_idx]
+            mask_left = vals < node.split_threshold
+            if node.left is not None:
+                _walk(node.left, row_idx[mask_left])
+            if node.right is not None:
+                _walk(node.right, row_idx[~mask_left])
+
+        _walk(self.root_, np.arange(n))
+        return paths
+
+    # ------------------------------------------------------------------
+    # OOS evaluation (Public API)
+    # ------------------------------------------------------------------
+
+    def evaluate(
+        self,
+        X: pd.DataFrame,
+        y: Union[pd.Series, np.ndarray],
+        time_col: Optional[Union[str, np.ndarray, pd.Series]] = None,
+        metrics: Sequence[str] = ("r2", "rank_ic"),
+        weights: Optional[Union[pd.Series, np.ndarray]] = None,
+    ) -> NodeEvalResult:
+        """Compute per-node out-of-sample (OOS) diagnostics.
+
+        For every node in the fitted tree (internal *and* leaf) this method
+        pools the OOS rows that the tree routes through it, runs the node's
+        predictor on that pool, and records its OOS metrics.  Internal-node
+        rows are obtained by *merging* the rows that reach the node's left
+        and right children, so internal and leaf rows are directly
+        comparable.
+
+        Parameters
+        ----------
+        X : DataFrame
+            OOS feature panel; must contain the columns used at ``fit`` time.
+        y : Series or ndarray
+            OOS target aligned with ``X``.
+        time_col : str, ndarray, Series, or None
+            Per-row time label, required for cross-sectional Rank-IC.  If a
+            string, treated as a column name in ``X``.  If ``None``,
+            ``rank_ic`` is silently dropped from the requested metrics.
+        metrics : sequence of str, default ``("r2", "rank_ic")``
+            Subset of ``{"r2", "rank_ic"}`` to compute.
+        weights : Series or ndarray, optional
+            Observation weights forwarded to the R² calculation.
+
+        Returns
+        -------
+        NodeEvalResult
+            Structured container; see :class:`NodeEvalResult` for the
+            ``per_node_df`` schema.  Child-difference columns
+            (``delta_oos_r2``, ``delta_oos_rank_ic``) are populated for
+            internal nodes by feeding both children's pools through the
+            children's predictors.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+
+        # ------------------------------------------------------------------
+        # Resolve inputs.
+        # ------------------------------------------------------------------
+        X_arr = X[self._feature_names].values.astype(np.float64)
+        if isinstance(y, pd.Series):
+            y_arr = y.values.astype(np.float64)
+        else:
+            y_arr = np.asarray(y, dtype=np.float64)
+        if weights is None:
+            w_arr = None
+        elif isinstance(weights, pd.Series):
+            w_arr = weights.values.astype(np.float64)
+        else:
+            w_arr = np.asarray(weights, dtype=np.float64)
+
+        if isinstance(time_col, str):
+            if time_col in X.columns:
+                t_arr: Optional[np.ndarray] = X[time_col].values
+            else:
+                raise KeyError(
+                    f"time_col={time_col!r} is not a column of X."
+                )
+        elif isinstance(time_col, pd.Series):
+            t_arr = time_col.values
+        elif time_col is not None:
+            t_arr = np.asarray(time_col)
+        else:
+            t_arr = None
+
+        requested = tuple(metrics)
+        active_metrics: List[str] = []
+        for m in requested:
+            if m not in {"r2", "rank_ic"}:
+                raise ValueError(
+                    f"Unknown metric {m!r}; expected one of {{'r2','rank_ic'}}."
+                )
+            if m == "rank_ic" and t_arr is None:
+                continue  # silently dropped
+            active_metrics.append(m)
+
+        # ------------------------------------------------------------------
+        # Walk the tree top-down to record the row indices that reach each
+        # node.  We carry an int array of row indices through the recursion.
+        # ------------------------------------------------------------------
+        node_rows: Dict[int, np.ndarray] = {}
+        nodes_in_order: List[PanelTreeNode] = []
+
+        def _collect(node: PanelTreeNode, idx: np.ndarray) -> None:
+            node_rows[node.node_id] = idx
+            nodes_in_order.append(node)
+            if node.is_leaf:
+                return
+            feat_idx = node._split_feature_idx
+            if feat_idx is None:
+                feat_idx = self._feature_names.index(node.split_feature)
+            vals = X_arr[idx, feat_idx]
+            mask_left = vals < node.split_threshold
+            if node.left is not None:
+                _collect(node.left, idx[mask_left])
+            if node.right is not None:
+                _collect(node.right, idx[~mask_left])
+
+        _collect(self.root_, np.arange(X_arr.shape[0]))
+
+        # ------------------------------------------------------------------
+        # Per-node OOS metrics.
+        # ------------------------------------------------------------------
+        per_node_metrics: Dict[int, Dict[str, float]] = {}
+        rows: List[Dict[str, Any]] = []
+
+        def _metrics_for(
+            node: PanelTreeNode, idx: np.ndarray
+        ) -> Dict[str, float]:
+            out: Dict[str, float] = {"n_oos": int(len(idx))}
+            if node.predictor is None or len(idx) == 0:
+                if "r2" in active_metrics:
+                    out["oos_r2"] = float("nan")
+                if "rank_ic" in active_metrics:
+                    out["oos_rank_ic_mean"] = float("nan")
+                    out["oos_rank_ic_ir"] = float("nan")
+                return out
+            y_sub = y_arr[idx]
+            y_pred = node.predictor.predict(X_arr[idx])
+            if "r2" in active_metrics:
+                w_sub = None if w_arr is None else w_arr[idx]
+                reg = evaluate_regression(y_sub, y_pred, w_sub)
+                out["oos_r2"] = float(reg["r2"])
+            if "rank_ic" in active_metrics:
+                t_sub = t_arr[idx]
+                ic_mean, ic_ir = self._cross_sectional_rank_ic(
+                    y_sub, y_pred, t_sub
+                )
+                out["oos_rank_ic_mean"] = ic_mean
+                out["oos_rank_ic_ir"] = ic_ir
+            return out
+
+        for node in nodes_in_order:
+            idx = node_rows[node.node_id]
+            node_metrics = _metrics_for(node, idx)
+            per_node_metrics[node.node_id] = node_metrics
+
+            row: Dict[str, Any] = {
+                "node_id": node.node_id,
+                "depth": node.depth,
+                "is_leaf": bool(node.is_leaf),
+                "split_feature": node.split_feature,
+                "split_threshold": node.split_threshold,
+                "n_oos": node_metrics["n_oos"],
+                "train_r2": float(node.metrics.get("r2", float("nan"))),
+            }
+            if "r2" in active_metrics:
+                row["oos_r2"] = node_metrics.get("oos_r2", float("nan"))
+            if "rank_ic" in active_metrics:
+                row["oos_rank_ic_mean"] = node_metrics.get(
+                    "oos_rank_ic_mean", float("nan")
+                )
+                row["oos_rank_ic_ir"] = node_metrics.get(
+                    "oos_rank_ic_ir", float("nan")
+                )
+
+            # Child-difference columns for internal nodes.
+            if not node.is_leaf and node.left is not None and node.right is not None:
+                lm = per_node_metrics.get(node.left.node_id) or _metrics_for(
+                    node.left, node_rows[node.left.node_id]
+                )
+                rm = per_node_metrics.get(node.right.node_id) or _metrics_for(
+                    node.right, node_rows[node.right.node_id]
+                )
+                if "r2" in active_metrics:
+                    l_r2 = lm.get("oos_r2", float("nan"))
+                    r_r2 = rm.get("oos_r2", float("nan"))
+                    row["left_oos_r2"] = l_r2
+                    row["right_oos_r2"] = r_r2
+                    row["delta_oos_r2"] = float(l_r2 - r_r2)
+                if "rank_ic" in active_metrics:
+                    l_ic = lm.get("oos_rank_ic_mean", float("nan"))
+                    r_ic = rm.get("oos_rank_ic_mean", float("nan"))
+                    row["left_oos_rank_ic_mean"] = l_ic
+                    row["right_oos_rank_ic_mean"] = r_ic
+                    row["delta_oos_rank_ic"] = float(l_ic - r_ic)
+
+            rows.append(row)
+
+        per_node_df = pd.DataFrame(rows)
+
+        # Leaf assignments for downstream convenience.
+        leaf_assignments = np.empty(X_arr.shape[0], dtype=np.int64)
+        self._assign_leaf_ids(
+            self.root_, X_arr, np.arange(X_arr.shape[0]), leaf_assignments
+        )
+
+        return NodeEvalResult(
+            per_node_df=per_node_df,
+            per_node_metrics=per_node_metrics,
+            leaf_assignments=leaf_assignments,
+            metrics=tuple(active_metrics),
+        )
+
+    @staticmethod
+    def _cross_sectional_rank_ic(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        time: np.ndarray,
+    ) -> Tuple[float, float]:
+        """Compute the mean and IR of per-period cross-sectional Spearman IC.
+
+        Within each time period the Spearman rank correlation between
+        ``y_true`` and ``y_pred`` is computed; the mean / IR are reported
+        across periods (IR = mean / std).  Periods with fewer than 2
+        observations or zero variance in either side are skipped.
+
+        Returns
+        -------
+        (mean, ir) : tuple of float
+            Both ``float('nan')`` when no period qualified.
+        """
+        if len(y_true) == 0:
+            return float("nan"), float("nan")
+        ics: List[float] = []
+        for t in np.unique(time):
+            mask = time == t
+            if mask.sum() < 2:
+                continue
+            yt = y_true[mask]
+            yp = y_pred[mask]
+            rt = pd.Series(yt).rank().values
+            rp = pd.Series(yp).rank().values
+            if rt.std() < 1e-12 or rp.std() < 1e-12:
+                continue
+            ic = float(np.corrcoef(rt, rp)[0, 1])
+            if np.isfinite(ic):
+                ics.append(ic)
+        if not ics:
+            return float("nan"), float("nan")
+        arr = np.asarray(ics, dtype=np.float64)
+        mean = float(arr.mean())
+        sd = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+        ir = float(mean / sd) if sd > 1e-12 else 0.0
+        return mean, ir
+
+    # ------------------------------------------------------------------
+    # ccp_alpha tuning (Public API)
+    # ------------------------------------------------------------------
+
+    def tune_ccp_alpha(
+        self,
+        X_val: pd.DataFrame,
+        y_val: Union[pd.Series, np.ndarray],
+        metric: str = "r2",
+        time_col: Optional[Union[str, np.ndarray, pd.Series]] = None,
+        weights: Optional[Union[pd.Series, np.ndarray]] = None,
+    ) -> Tuple[float, pd.DataFrame]:
+        """Sweep cost-complexity ``ccp_alpha`` values and pick the OOS-best.
+
+        For each alpha in :meth:`cost_complexity_pruning_path`, a deep copy
+        of the engine is pruned at that alpha and evaluated on
+        ``(X_val, y_val)`` via :meth:`evaluate`.  The alpha maximising the
+        root-node OOS metric is returned together with the full curve.
+
+        Parameters
+        ----------
+        X_val, y_val : DataFrame / Series-like
+            Validation panel.
+        metric : {"r2", "rank_ic"}, default "r2"
+            Metric to maximise (root-node value).  ``"rank_ic"`` requires
+            ``time_col``.
+        time_col, weights
+            Forwarded to :meth:`evaluate`.
+
+        Returns
+        -------
+        best_alpha : float
+        curve : DataFrame
+            Columns ``ccp_alpha, n_leaves, oos_<metric>``.  The
+            ``alpha = 0`` row is the unpruned tree.
+        """
+        assert self.root_ is not None, "Call .fit() first."
+        if metric not in {"r2", "rank_ic"}:
+            raise ValueError(
+                f"metric must be 'r2' or 'rank_ic', got {metric!r}."
+            )
+
+        path = self.cost_complexity_pruning_path()
+        alphas = path["ccp_alphas"]
+
+        rows: List[Dict[str, Any]] = []
+        # Metric column name in NodeEvalResult.per_node_df.
+        col = "oos_r2" if metric == "r2" else "oos_rank_ic_mean"
+
+        for alpha in alphas:
+            clone = copy.deepcopy(self)
+            if alpha > 0:
+                clone.prune(float(alpha))
+            result = clone.evaluate(
+                X_val, y_val,
+                time_col=time_col,
+                metrics=("r2", "rank_ic") if metric == "rank_ic" else ("r2",),
+                weights=weights,
+            )
+            df = result.per_node_df
+            root_row = df.loc[df["node_id"] == clone.root_.node_id]
+            score = (
+                float(root_row[col].iloc[0])
+                if not root_row.empty and col in root_row.columns
+                else float("nan")
+            )
+            _, n_leaves = self._subtree_stats(clone.root_)
+            rows.append(
+                {
+                    "ccp_alpha": float(alpha),
+                    "n_leaves": int(n_leaves),
+                    f"oos_{metric}": score,
+                }
+            )
+
+        curve = pd.DataFrame(rows)
+        valid = curve[f"oos_{metric}"].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if valid.empty:
+            best_alpha = float(alphas[0])
+        else:
+            best_alpha = float(curve.loc[valid.idxmax(), "ccp_alpha"])
+        return best_alpha, curve
+
+    # ------------------------------------------------------------------
     # SDF / efficient-frontier aggregation (C3)
     # ------------------------------------------------------------------
+
 
     def build_sdf_factor(
         self,
@@ -653,6 +1102,7 @@ class PanelTreeEngine:
             rule=rule,
             parent_id=parent_id,
             sample_ratio=len(indices) / max(self._total_samples, 1),
+            _n_samples_cached=int(len(indices)),
         )
 
         # Fit local predictor on this node
