@@ -228,7 +228,9 @@ print(mosaic.iloc[:, :5].to_string())
 try:
     import matplotlib
     matplotlib.use("Agg")  # 无头模式
-    save_path = os.path.join(os.path.dirname(__file__), "mosaic.png")
+    out_dir = os.path.join(os.path.dirname(__file__), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    save_path = os.path.join(out_dir, "demo_ptree_mosaic.png")
     fig, ax = viz.plot_mosaic(mosaic, title="P-Tree Prediction Mosaic (R²)", save_path=save_path)
     print(f"\n  马赛克图已保存至: {save_path}")
 except ImportError:
