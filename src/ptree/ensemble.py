@@ -88,8 +88,24 @@ def _fit_one_tree(
     base_params: Dict[str, Any],
     max_features: Optional[Union[str, int, float]],
     seed: int,
+    regime_metric: str = "train_r2",
+    regime_aggregation: str = "train",
 ) -> Dict[str, Any]:
-    """Fit a single bootstrapped P-Tree and return it with its OOB time set."""
+    """Fit a single bootstrapped P-Tree and return it with its OOB time set.
+
+    Parameters
+    ----------
+    regime_metric : {"train_r2", "oof_r2", "rank_ic"}, default "train_r2"
+        Metric used to rank leaves when building the "high-predictability"
+        regime set.  ``"train_r2"`` (legacy) uses the leaf's in-sample R²;
+        ``"oof_r2"`` recomputes R² on the OOB rows routed to each leaf;
+        ``"rank_ic"`` uses the cross-sectional rank-IC averaged over OOB
+        time periods.
+    regime_aggregation : {"train", "oof"}, default "train"
+        ``"train"`` (legacy) ranks leaves on the bootstrap-train metric;
+        ``"oof"`` ranks leaves on the OOB sample (more robust, but degrades
+        gracefully to the train metric if a leaf has no OOB rows).
+    """
     rng = np.random.default_rng(seed)
     sampled_times = _block_bootstrap_times(unique_times, block_size, rng)
 
@@ -121,22 +137,155 @@ def _fit_one_tree(
     engine = PanelTreeEngine(**params)
     engine.fit(X_tr, y_tr, feature_names=feature_names, weights=w_tr)
 
-    # Record the "high-predictability" leaves (R^2 above the tree's leaf median)
-    # so the forest can later compute soft regime-membership probabilities.
+    # Record the "high-predictability" leaves so the forest can later compute
+    # soft regime-membership probabilities.  ``regime_aggregation`` controls
+    # whether the ranking metric is computed in-sample (legacy) or on the OOB
+    # rows (more robust, addresses the "train-R² doesn't generalise" issue).
     leaves = engine.get_leaves()
-    leaf_r2 = [leaf.metrics.get("r2", 0.0) for leaf in leaves]
-    median_r2 = float(np.median(leaf_r2)) if leaf_r2 else 0.0
-    high_leaf_ids = {
-        leaf.node_id
-        for leaf, r2 in zip(leaves, leaf_r2)
-        if r2 >= median_r2
-    }
+    high_leaf_ids = _select_high_leaves(
+        engine=engine,
+        leaves=leaves,
+        X_full=X,
+        y_full=y,
+        time_full=time_arr,
+        oob_times=oob_times,
+        feature_names=feature_names,
+        regime_metric=regime_metric,
+        regime_aggregation=regime_aggregation,
+    )
 
     return {
         "engine": engine,
         "oob_times": oob_times,
         "high_leaf_ids": high_leaf_ids,
     }
+
+
+def _mean_rank_ic(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    time_arr: np.ndarray,
+) -> float:
+    """Cross-sectional rank-IC averaged over time periods.
+
+    For each unique time ``t``, compute Spearman-style correlation between
+    rank-transformed ``y_true`` and ``y_pred`` over the cross-section, then
+    average across times.  Times with fewer than 3 obs are skipped.
+    """
+    ics: List[float] = []
+    for t in np.unique(time_arr):
+        mask = time_arr == t
+        if int(mask.sum()) < 3:
+            continue
+        yt = pd.Series(y_true[mask]).rank().values
+        yp = pd.Series(y_pred[mask]).rank().values
+        std_yt = yt.std(ddof=0)
+        std_yp = yp.std(ddof=0)
+        if std_yt < 1e-12 or std_yp < 1e-12:
+            continue
+        ic = float(np.corrcoef(yt, yp)[0, 1])
+        if np.isfinite(ic):
+            ics.append(ic)
+    if not ics:
+        return float("nan")
+    return float(np.mean(ics))
+
+
+def _select_high_leaves(
+    engine: "PanelTreeEngine",
+    leaves: List[Any],
+    X_full: pd.DataFrame,
+    y_full: pd.Series,
+    time_full: np.ndarray,
+    oob_times: np.ndarray,
+    feature_names: List[str],
+    regime_metric: str,
+    regime_aggregation: str,
+) -> set:
+    """Return the set of leaf ids that count as "high-predictability".
+
+    The default (``regime_aggregation="train"``) preserves the legacy behavior
+    (leaves whose in-sample R² is above the tree's leaf median).  Setting
+    ``regime_aggregation="oof"`` recomputes the chosen ``regime_metric``
+    (``"oof_r2"`` or ``"rank_ic"``) on the OOB rows for each leaf and ranks by
+    that — more robust on low-signal financial panels.
+    """
+    if not leaves:
+        return set()
+
+    # Legacy: rank by in-sample R^2.
+    if regime_aggregation == "train" or regime_metric == "train_r2":
+        leaf_r2 = [leaf.metrics.get("r2", 0.0) for leaf in leaves]
+        median_r2 = float(np.median(leaf_r2)) if leaf_r2 else 0.0
+        return {
+            leaf.node_id
+            for leaf, r2 in zip(leaves, leaf_r2)
+            if r2 >= median_r2
+        }
+
+    # OOF-based scoring.  Route every OOB row to its leaf and aggregate.
+    if oob_times is None or len(oob_times) == 0:
+        # No OOB available: fall back to train R^2.
+        leaf_r2 = [leaf.metrics.get("r2", 0.0) for leaf in leaves]
+        median_r2 = float(np.median(leaf_r2)) if leaf_r2 else 0.0
+        return {
+            leaf.node_id
+            for leaf, r2 in zip(leaves, leaf_r2)
+            if r2 >= median_r2
+        }
+
+    oob_set = set(
+        t.item() if hasattr(t, "item") else t for t in oob_times
+    )
+    oob_mask = np.array(
+        [(t.item() if hasattr(t, "item") else t) in oob_set for t in time_full]
+    )
+    if not oob_mask.any():
+        leaf_r2 = [leaf.metrics.get("r2", 0.0) for leaf in leaves]
+        median_r2 = float(np.median(leaf_r2)) if leaf_r2 else 0.0
+        return {
+            leaf.node_id
+            for leaf, r2 in zip(leaves, leaf_r2)
+            if r2 >= median_r2
+        }
+
+    X_oob = X_full.iloc[oob_mask].reset_index(drop=True)
+    y_oob = np.asarray(y_full)[oob_mask].astype(np.float64)
+    t_oob = time_full[oob_mask]
+
+    # Route OOB rows to leaves via the engine's public/internal API.
+    try:
+        leaf_ids = engine.predict_leaves(X_oob)
+    except AttributeError:  # pragma: no cover - kept for safety on older engines
+        X_arr = X_oob[feature_names].values.astype(np.float64)
+        leaf_ids = np.empty(X_arr.shape[0], dtype=int)
+        engine._assign_leaf_ids(
+            engine.root_, X_arr, np.arange(X_arr.shape[0]), leaf_ids
+        )
+
+    yhat_oob = engine.predict(X_oob)
+
+    scores: Dict[int, float] = {}
+    for leaf in leaves:
+        m = leaf_ids == leaf.node_id
+        if int(m.sum()) < 3:
+            scores[leaf.node_id] = float("-inf")
+            continue
+        y_l = y_oob[m]
+        yhat_l = yhat_oob[m]
+        if regime_metric == "rank_ic":
+            scores[leaf.node_id] = _mean_rank_ic(y_l, yhat_l, t_oob[m])
+        else:  # default OOF metric: R^2
+            ss_res = float(np.sum((y_l - yhat_l) ** 2))
+            y_mean = float(np.mean(y_l))
+            ss_tot = float(np.sum((y_l - y_mean) ** 2))
+            scores[leaf.node_id] = 1.0 - ss_res / max(ss_tot, 1e-12)
+
+    finite = [s for s in scores.values() if np.isfinite(s)]
+    if not finite:
+        return set()
+    median_s = float(np.median(finite))
+    return {nid for nid, s in scores.items() if np.isfinite(s) and s >= median_s}
 
 
 class PanelForest:
@@ -169,6 +318,16 @@ class PanelForest:
         feature subsetting (fully reproducible).
     verbose : int, default 0
         Verbosity passed through to each tree (and forest-level logging).
+    regime_metric : {"train_r2", "oof_r2", "rank_ic"}, default "train_r2"
+        Metric each tree uses to rank its leaves when building the
+        "high-predictability" set surfaced by :meth:`regime_membership`.
+        ``"train_r2"`` (default, legacy) ranks by in-sample R²; ``"oof_r2"``
+        and ``"rank_ic"`` rank on the OOB sample (only effective when
+        ``regime_aggregation="oof"``).
+    regime_aggregation : {"train", "oof"}, default "train"
+        ``"train"`` (default, legacy) preserves the original behavior.
+        ``"oof"`` scores leaves on each tree's OOB rows — more robust on
+        low-signal financial panels where train R² doesn't generalise.
     """
 
     def __init__(
@@ -181,6 +340,8 @@ class PanelForest:
         n_jobs: int = 1,
         random_state: Optional[int] = None,
         verbose: int = 0,
+        regime_metric: str = "train_r2",
+        regime_aggregation: str = "train",
     ):
         if n_estimators < 1:
             raise ValueError("n_estimators must be >= 1.")
@@ -191,6 +352,16 @@ class PanelForest:
                 f"aggregate must be 'mean', 'consensus' or 'sdf', got "
                 f"{aggregate!r}."
             )
+        if regime_metric not in {"train_r2", "oof_r2", "rank_ic"}:
+            raise ValueError(
+                f"regime_metric must be one of 'train_r2', 'oof_r2', "
+                f"'rank_ic', got {regime_metric!r}."
+            )
+        if regime_aggregation not in {"train", "oof"}:
+            raise ValueError(
+                f"regime_aggregation must be 'train' or 'oof', got "
+                f"{regime_aggregation!r}."
+            )
         self.n_estimators = n_estimators
         self.max_features = max_features
         self.block_size = block_size
@@ -199,6 +370,8 @@ class PanelForest:
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.verbose = verbose
+        self.regime_metric = regime_metric
+        self.regime_aggregation = regime_aggregation
 
         # Populated after fit.
         self.trees_: List[PanelTreeEngine] = []
@@ -275,6 +448,7 @@ class PanelForest:
                 delayed(_fit_one_tree)(
                     X, y, self._feature_names, w_arr, time_arr, unique_times,
                     self.block_size, base_params, self.max_features, seed,
+                    self.regime_metric, self.regime_aggregation,
                 )
                 for seed in seeds
             )
@@ -283,6 +457,7 @@ class PanelForest:
                 _fit_one_tree(
                     X, y, self._feature_names, w_arr, time_arr, unique_times,
                     self.block_size, base_params, self.max_features, seed,
+                    self.regime_metric, self.regime_aggregation,
                 )
                 for seed in seeds
             ]
