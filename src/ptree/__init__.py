@@ -28,7 +28,7 @@ Example
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "ElenYoung"
 
 from ptree.data_handler import DataHandler
@@ -46,16 +46,18 @@ from ptree.criteria import (
     CriterionBase,
     R2DiffCriterion,
     WeightedR2DiffCriterion,
+    RankICDiffCriterion,
     MeanVarianceCriterion,
     ClassificationCriterion,
 )
 
 
 from ptree.node import PanelTreeNode
-from ptree.engine import PanelTreeEngine
+from ptree.engine import PanelTreeEngine, NodeEvalResult
 from ptree.ensemble import PanelForest, BoostedPanelTree
 
 from ptree.visualization import MosaicVisualizer, NodeReporter
+
 
 
 __all__ = [
@@ -77,6 +79,7 @@ __all__ = [
     "CriterionBase",
     "R2DiffCriterion",
     "WeightedR2DiffCriterion",
+    "RankICDiffCriterion",
     "MeanVarianceCriterion",
     "ClassificationCriterion",
 
@@ -84,6 +87,7 @@ __all__ = [
     # Core classes
     "PanelTreeNode",
     "PanelTreeEngine",
+    "NodeEvalResult",
     # Ensembles
     "PanelForest",
     "BoostedPanelTree",
