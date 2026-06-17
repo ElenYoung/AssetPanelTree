@@ -250,9 +250,23 @@ class NodeReporter:
                 parts.append(f"{_METRIC_DISPLAY.get(k, k)}={int(v)}")
         return ", ".join(parts)
 
-    @staticmethod
-    def _format_eval_row(row: Dict[str, Any]) -> str:
-        """Format the OOS columns of a NodeEvalResult row into a suffix."""
+    # Classification OOS columns to render in print_tree / to_graphviz.
+    # Kept in sync with engine._VALID_METRICS classification subset.
+    _OOS_CLS_COLS = (
+        ("precision", "Prec"),
+        ("f1", "F1"),
+        ("auc", "AUC"),
+        ("logloss", "LogLoss"),
+    )
+
+    @classmethod
+    def _format_eval_row(cls, row: Dict[str, Any]) -> str:
+        """Format the OOS columns of a NodeEvalResult row into a suffix.
+
+        Supports the full ``engine._VALID_METRICS`` set so callers using
+        classification criteria (precision / f1 / auc / logloss) see their
+        OOS metric in ``print_tree`` / ``to_graphviz`` output.
+        """
         bits: List[str] = []
         n_oos = row.get("n_oos")
         if n_oos is not None and not pd.isna(n_oos):
@@ -268,11 +282,20 @@ class NodeReporter:
                 )
             else:
                 bits.append(f"OOS IC={row['oos_rank_ic_mean']:+.{_DEC}f}")
+        for key, disp in cls._OOS_CLS_COLS:
+            col = f"oos_{key}"
+            if col in row and not pd.isna(row[col]):
+                bits.append(f"OOS {disp}={row[col]:.{_DEC}f}")
         return " | ".join(bits)
 
-    @staticmethod
-    def _format_child_diff_row(row: Dict[str, Any]) -> str:
-        """Format the ΔR² / ΔIC summary line for an internal node."""
+    @classmethod
+    def _format_child_diff_row(cls, row: Dict[str, Any]) -> str:
+        """Format the Δ summary line for an internal node.
+
+        Renders ΔR² / ΔIC for regression criteria *and* ΔPrec / ΔF1 / ΔAUC /
+        ΔLogLoss when the corresponding classification OOS columns are
+        present in *row*.
+        """
         bits: List[str] = []
         if "delta_oos_r2" in row and not pd.isna(row["delta_oos_r2"]):
             l = row.get("left_oos_r2", float("nan"))
@@ -288,6 +311,15 @@ class NodeReporter:
                 f"ΔIC={row['delta_oos_rank_ic']:+.{_DEC}f} "
                 f"(L={l:+.{_DEC}f} vs R={r:+.{_DEC}f})"
             )
+        for key, disp in cls._OOS_CLS_COLS:
+            d_col = f"delta_oos_{key}"
+            if d_col in row and not pd.isna(row[d_col]):
+                l = row.get(f"left_oos_{key}", float("nan"))
+                r = row.get(f"right_oos_{key}", float("nan"))
+                bits.append(
+                    f"Δ{disp}={row[d_col]:+.{_DEC}f} "
+                    f"(L={l:.{_DEC}f} vs R={r:.{_DEC}f})"
+                )
         return " | ".join(bits)
 
     def _print_recursive(
@@ -550,18 +582,22 @@ class NodeReporter:
         crit_disp = _crit_metric_display(self.engine)
 
         # Map crit_key → (IS key in node.metrics, OOS col, Δ col).
-        # The engine currently emits OOS columns only for r2 / rank_ic;
-        # for other criteria we fall back to the IS metric alone.
+        # OOS columns are emitted by ``PanelTreeEngine.evaluate`` when the
+        # corresponding metric is requested (see engine._VALID_METRICS):
+        # regression metrics ``r2`` / ``rank_ic`` *and* the classification
+        # metrics ``precision`` / ``f1`` / ``auc`` / ``logloss``.  Whenever an
+        # entry has non-None OOS / Δ columns, ``plot_tree`` will render an
+        # "OOS …" / "Δ…" row in the corresponding node box.
         _METRIC_AXIS = {
             "r2": ("r2", "oos_r2", "delta_oos_r2"),
             "rank_ic": ("rank_ic_mean", "oos_rank_ic_mean",
                         "delta_oos_rank_ic"),
             "rank_ic_mean": ("rank_ic_mean", "oos_rank_ic_mean",
                              "delta_oos_rank_ic"),
-            "precision": ("precision", None, None),
-            "f1": ("f1", None, None),
-            "auc": ("auc", None, None),
-            "logloss": ("logloss", None, None),
+            "precision": ("precision", "oos_precision", "delta_oos_precision"),
+            "f1": ("f1", "oos_f1", "delta_oos_f1"),
+            "auc": ("auc", "oos_auc", "delta_oos_auc"),
+            "logloss": ("logloss", "oos_logloss", "delta_oos_logloss"),
         }
         is_key, oos_col, delta_col = _METRIC_AXIS.get(
             crit_key, ("r2", "oos_r2", "delta_oos_r2")
