@@ -10,8 +10,7 @@
 > 概念背景见 [`README.md`](../README.md)；算法规范见 [`ALGORITHM.md`](ALGORITHM.md)。
 >
 > Every entry follows the same template:
-> *Signature / 签名 → Purpose / 作用 → Parameters / 参数 → Returns / 返回 → Example / 示例.*
-> 每条 API 条目格式统一：*签名 → 作用 → 参数 → 返回 → 示例*。
+> *Signature → Purpose → Parameters → Returns → Example.*
 
 ---
 
@@ -55,7 +54,7 @@ from ptree import (
 )
 ```
 
-| Name / 名字 | One-liner / 一句话说明 |
+| Name | Description |
 |---|---|
 | `DataHandler` | Panel preprocessing: alignment, fillna, cross-sectional rank, vol weights / 面板预处理：对齐、缺失填充、截面秩标准化、波动率权重 |
 | `RidgeRegressor` | Closed-form L2 leaf regressor / 闭式 L2 岭回归 |
@@ -79,7 +78,7 @@ from ptree import (
 
 ### 0.2 Task → API cheat sheet / 任务 → API 速查
 
-| I want to … / 我想 … | Call / 调用 |
+| I want to … | Call |
 |---|---|
 | Preprocess a raw `(date, asset_id, …)` DataFrame / 预处理原始面板 DataFrame | `DataHandler().fit_transform(...)` |
 | Build the tree / 训练一棵 P-Tree | `PanelTreeEngine(...).fit(X, y, feature_names=...)` |
@@ -109,7 +108,7 @@ Module: `ptree.data_handler`
 
 ### 1.1 `DataHandler.__init__`
 
-**Signature / 签名**
+**Signature**
 
 ```python
 DataHandler(
@@ -120,14 +119,14 @@ DataHandler(
 )
 ```
 
-**Purpose / 作用.**
+**Purpose.**
 Panel preprocessing: align `(X, y)`, fill missing values, optionally
 cross-sectionally rank-standardise features to `[0, 1]`, and (optionally)
 compute inverse-volatility weights from a return series.
 面板预处理：对齐 `(X, y)`、填充缺失、可选地把特征按截面秩归一到 `[0, 1]`、并可基于
 收益序列计算逆波动率权重。
 
-| Param / 参数 | Type / 类型 | Default / 默认 | Meaning / 含义 |
+| Param | Type | Default | Meaning |
 |---|---|---|---|
 | `cs_rank_standardize` | `bool` | `True` | Apply per-cross-section rank → `[0,1]` mapping / 每个时间截面内做秩归一 |
 | `vol_window` | `int` | `60` | Rolling window for realised volatility / 波动率滚动窗口 |
@@ -162,7 +161,7 @@ transform(
 Apply the pipeline.
 应用预处理流水线。
 
-**Returns / 返回**
+**Returns**
 - `X_processed`: cleaned (and optionally rank-standardised) feature panel,
   retains `time_col`/`entity_col` columns. / 清洗后的特征面板。
 - `y_processed`: target aligned with `X_processed`. / 与 X 对齐后的目标。
@@ -186,7 +185,7 @@ dh.feature_names  # -> List[str]
 Feature column names learnt during `fit` (excludes `time_col`/`entity_col`).
 `fit` 学到的特征列名（不含时间 / 实体列）。
 
-### 1.6 Example / 示例
+### 1.6 Example
 
 ```python
 from ptree import DataHandler
@@ -223,7 +222,7 @@ class PredictorBase(ABC):
     def get_params(self)       -> Dict[str, Any]: ...
 ```
 
-| Method / 方法 | Returns / 返回 | Notes / 备注 |
+| Method | Returns | Notes |
 |---|---|---|
 | `fit(X, y, weights=None)` | `self` | Weights are optional; closed-form predictors also accept cached `XtWX`/`XtWy` via keyword arguments. / 权重可选；闭式 predictor 还接受 `XtWX`/`XtWy` 关键字以做增量更新。 |
 | `predict(X)` | `ndarray` shape `(n,)` | — |
@@ -436,7 +435,7 @@ ClassificationCriterion(
 
 ### 3.7 Helper functions / 辅助函数
 
-| Function / 函数 | Returns / 返回 |
+| Function | Returns |
 |---|---|
 | `evaluate_regression(y_true, y_pred, weights=None)` | `{"r2", "mse", "n_samples", "n_features"}` |
 | `evaluate_classification(y_true, y_proba, threshold=0.5)` | `{"precision", "f1", "auc", "logloss", "n_samples"}` |
@@ -451,7 +450,7 @@ directly for ad-hoc metric computation.
 
 Module: `ptree.engine`.
 
-### 4.1 Constructor / 构造函数
+### 4.1 Constructor
 
 ```python
 PanelTreeEngine(
@@ -479,9 +478,9 @@ PanelTreeEngine(
 )
 ```
 
-Parameters grouped by role / 按用途分组：
+Parameters grouped by role:
 
-**Core / 核心**
+**Core**
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -491,7 +490,7 @@ Parameters grouped by role / 按用途分组：
 | `min_samples` | `100` | Min samples for a node to be splittable / 节点可分裂所需的最小样本数 |
 | `min_impurity_decrease` | `0.0` | Best-split score floor / 最优切分分阈值；不达则成叶 |
 
-**Threshold search / 阈值搜索**
+**Threshold search**
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -501,7 +500,7 @@ Parameters grouped by role / 按用途分组：
 | `n_random_splits` | `1` | Random thresholds per feature when `splitter="random"` |
 | `max_features` | `None` | Random feature subset per node: `None / "sqrt" / "log2" / int / float`. Used by ensembles to decorrelate trees |
 
-**Honest splits / 诚实切分**
+**Honest splits**
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -510,7 +509,7 @@ Parameters grouped by role / 按用途分组：
 | `honest_refit_full` | `True` | After choosing the split, refit leaf models on the full sample |
 | `random_state` | `None` | Seed for honest split, random splitter and feature subset / 随机种子（控制诚实切分、随机阈值、随机特征子集） |
 
-**Performance / 性能**
+**Performance**
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -520,7 +519,7 @@ Parameters grouped by role / 按用途分组：
 | `parallel_backend` | `"threads"` | joblib backend: `"threads"` or `"processes"` |
 | `keep_node_stats` | `False` | Keep per-node cached `XtWX/XtWy` after splitting / 是否保留节点统计量 |
 
-**Logging / 日志**
+**Logging**
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -547,9 +546,9 @@ series payload. A `str` is treated as a column name in `X`.
 构建树。当准则为 `MeanVarianceCriterion` / `RankICDiffCriterion` 时
 **必须**传入 `time_index`。
 
-**Returns / 返回**: `self` (chaining).
+**Returns**: `self` (chaining).
 
-### 4.3 Prediction APIs / 预测系列
+### 4.3 Prediction APIs
 
 #### `engine.predict(X)`
 
@@ -584,7 +583,7 @@ paths = engine.predict_node_path(X.head(3))
 # paths[0] == [0, 1, 4]  → root → node 1 → leaf 4
 ```
 
-### 4.4 `engine.evaluate` — per-node OOS diagnostics / 逐节点 OOS 评估
+### 4.4 `engine.evaluate` — per-node OOS diagnostics
 
 ```python
 evaluate(
@@ -608,7 +607,7 @@ directly comparable.
 | `metrics` | Subset of `{"r2","rank_ic","sharpe","precision","f1","auc","logloss"}`. |
 | `weights` | Forwarded to weighted R². |
 
-**Returns / 返回**: a [`NodeEvalResult`](#6-nodeevalresult--oos-评估容器).
+**Returns**: a [`NodeEvalResult`](#6-nodeevalresult--oos-评估容器).
 
 ```python
 result = engine.evaluate(X_oos, y_oos, time_col="date",
@@ -617,7 +616,7 @@ print(result.per_node_df.head())
 print(reporter.print_tree(evaluation=result, show_child_diff=True))
 ```
 
-### 4.5 Node inspection / 节点查询
+### 4.5 Node inspection
 
 | Method | Returns |
 |---|---|
@@ -626,9 +625,9 @@ print(reporter.print_tree(evaluation=result, show_child_diff=True))
 | `engine.get_node_report()` | `pd.DataFrame` — one row per node (see schema below) / 每节点一行的 DataFrame |
 | `engine.get_leaf_samples()` | `Dict[int, np.ndarray]` — leaf id → row indices / 叶子 id → 原始行索引 |
 
-`get_node_report()` columns / 列：
+`get_node_report()` columns:
 
-| Column / 列 | Description / 含义 |
+| Column | Description |
 |---|---|
 | `Node_ID` | Node id / 节点 id |
 | `Depth` | Depth, root = 0 / 深度，根为 0 |
@@ -645,7 +644,7 @@ print(reporter.print_tree(evaluation=result, show_child_diff=True))
 | `Elapsed_Time_s` | Seconds spent building this node |
 | `Parent_ID` | Parent node id, `None` for root |
 
-### 4.6 Pruning / 剪枝
+### 4.6 Pruning
 
 #### `engine.prune(ccp_alpha)`
 
@@ -686,10 +685,10 @@ Sweep `ccp_alpha` along the weakest-link path, evaluate each pruned tree on
 OOS metric. `logloss` is treated as "smaller is better" internally.
 沿弱链路径扫 `ccp_alpha`，挑使根节点 OOS 指标最优的 α。`logloss` 自动反号。
 
-**Returns / 返回**: `(best_alpha, curve_df)` where `curve_df` has columns
+**Returns**: `(best_alpha, curve_df)` where `curve_df` has columns
 `ccp_alpha`, `n_leaves`, `oos_<metric>`.
 
-### 4.7 `engine.build_sdf_factor` — SDF factor construction / SDF 因子构造
+### 4.7 `engine.build_sdf_factor` — SDF factor construction
 
 ```python
 build_sdf_factor(
@@ -710,7 +709,7 @@ have been called with `time_index`).
 把所有叶子多空组合按切线权重 `w ∝ Σ⁻¹μ` 组合成单一 SDF 因子。
 当 `X=None` 时复用训练数据。
 
-**Returns / 返回** (dict):
+**Returns** (dict):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -731,9 +730,9 @@ print(sdf["sharpe"], sdf["weights"])
 
 Module: `ptree.node`. Returned by `engine.get_leaves()` / `get_all_nodes()`.
 
-### 5.1 Attributes / 属性
+### 5.1 Attributes
 
-| Attribute / 属性 | Type | Meaning |
+| Attribute | Type | Meaning |
 |---|---|---|
 | `node_id` | `int` | Unique id within the tree |
 | `depth` | `int` | Depth (root = 0) |
@@ -752,7 +751,7 @@ Module: `ptree.node`. Returned by `engine.get_leaves()` / `get_all_nodes()`.
 | `feature_ranking` | `list[tuple]` or `None` | `(feature, threshold, score)` for child priority caching |
 | `honest_n_samples` | `int` or `None` | Eval-set size when `honest=True` |
 
-### 5.2 Methods / 方法
+### 5.2 Methods
 
 ```python
 node.get_model_weights()  -> Optional[np.ndarray]   # leaf model coefficients
@@ -784,9 +783,9 @@ class NodeEvalResult:
     metrics:            Tuple[str, ...]               # actually computed metrics
 ```
 
-### 6.1 `per_node_df` schema / 表结构
+### 6.1 `per_node_df` schema
 
-| Column / 列 | Always present? / 是否始终存在 | Meaning |
+| Column | Always present? | Meaning |
 |---|---|---|
 | `node_id`, `depth`, `is_leaf`, `split_feature`, `split_threshold`, `n_oos`, `train_r2` | Yes | Structural & training-side fields |
 | `oos_r2` | when `"r2"` requested | Pooled OOS R² over this node |
@@ -795,7 +794,7 @@ class NodeEvalResult:
 | `oos_precision`, `oos_f1`, `oos_auc`, `oos_logloss` | when the corresponding metric is in `metrics` | Classification OOS metrics |
 | `left_oos_<m>`, `right_oos_<m>`, `delta_oos_<m>` | internal nodes only | Child-side OOS metric and L−R difference, for every requested metric `<m>` |
 
-### 6.2 Typical use / 典型用法
+### 6.2 Typical use
 
 ```python
 result = engine.evaluate(X_oos, y_oos, time_col="date",
@@ -851,7 +850,7 @@ classification criterion auto-switches the default leaf predictor to
 | `regime_metric` | How leaves get ranked into the "high-predictability" set for `regime_membership`. `"train_r2"` / `"auto"` → `criterion.metric_key()`. |
 | `regime_aggregation` | `"train"` → leaf metric on bootstrap-train (legacy); `"oof"` → recompute on OOB rows (recommended on noisy panels). |
 
-**Attributes after `fit` / 拟合后属性**
+**Attributes after `fit`**
 
 | Attribute | Type | Meaning |
 |---|---|---|
@@ -976,7 +975,7 @@ predict(X: pd.DataFrame) -> np.ndarray
 
 Returns `ν · Σ_m T_m.predict(X)`.
 
-**Attributes / 属性**
+**Attributes**
 
 | Attribute | Type | Meaning |
 |---|---|---|
@@ -1025,7 +1024,7 @@ extra `↳ split gain | ΔR²=...` line is inserted under each internal node.
 print(reporter.print_tree(evaluation=result, show_child_diff=True))
 ```
 
-Sample output / 样例输出:
+Sample output:
 
 ```
 [Node 0] char_1 < 0.5 | n=12000, gain=0.457 | R²=0.123 | n_oos=4000 | OOS R²=+0.115
@@ -1098,14 +1097,14 @@ build_mosaic(
 ) -> pd.DataFrame
 ```
 
-| Metric / 指标 | Meaning |
+| Metric | Meaning |
 |---|---|
 | `"r2"` | Per-cell OOS R² of the leaf's predictor |
 | `"mean"` / `"median"` / `"std"` | Per-cell summary statistic of `y` |
 | `"ic"` | Per-cell Pearson correlation between prediction and `y` |
 | `"precision"` / `"f1"` / `"auc"` | Per-cell classification metric (via `predict_proba` if available) |
 
-**Returns / 返回**: DataFrame with row index = leaf `node_id` (sorted),
+**Returns**: DataFrame with row index = leaf `node_id` (sorted),
 columns = sorted unique time periods, values = metric. Empty `(leaf, time)`
 cells are `NaN`.
 
@@ -1159,7 +1158,7 @@ engine = PanelTreeEngine(..., verbose=1)
 engine.fit(X, y, feature_names=...)
 ```
 
-Typical output / 典型输出:
+Typical output:
 
 ```
 [INFO] [Level 0] Splitting Node 0...
@@ -1177,7 +1176,7 @@ The API additions you most often need to know about. (v0.1 defaults remain
 bit-for-bit reproducible — anything *new* is opt-in.)
 以下功能均为新增，启用前 v0.1 默认行为保持逐位可复现。
 
-| Since / 起始版本 | API |
+| Since | API |
 |---|---|
 | **v0.2** | `engine.evaluate(...) -> NodeEvalResult` |
 | v0.2 | `engine.predict_leaves(X)`, `engine.predict_node_path(X)` |
