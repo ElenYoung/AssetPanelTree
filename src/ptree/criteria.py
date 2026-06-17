@@ -413,9 +413,11 @@ class MeanVarianceCriterion(CriterionBase):
         return float(np.sqrt(sr_sq) * np.sqrt(self.annualization))
 
     def metric_key(self) -> str:
-        # Reuse ``r2`` for node-level logging/reporting; the criterion itself
-        # operates on the non-scalar ``_port_ret`` series.
-        return "r2"
+        # The criterion's natural per-node summary is the leaf's long-short
+        # portfolio Sharpe ratio.  The engine attaches a scalar ``sharpe``
+        # field to ``node.metrics`` when this criterion is active so that
+        # logging, node labels and ``NodeReporter`` can display it directly.
+        return "sharpe"
 
     def __repr__(self) -> str:
         return (
