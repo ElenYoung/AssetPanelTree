@@ -540,16 +540,24 @@ class PanelTreeEngine:
         else:
             t_arr = None
 
+        # Valid metric whitelist.  Classification metrics (``precision``,
+        # ``f1``, ``auc``, ``logloss``) are evaluated via
+        # :func:`evaluate_classification` and so are usable with classification
+        # criteria *and* with regression predictors whose ``predict`` output is
+        # already in [0, 1] (e.g. when callers feed binary labels in ``y``).
+        _VALID_METRICS = {"r2", "rank_ic", "precision", "f1", "auc", "logloss"}
         requested = tuple(metrics)
         active_metrics: List[str] = []
         for m in requested:
-            if m not in {"r2", "rank_ic"}:
+            if m not in _VALID_METRICS:
                 raise ValueError(
-                    f"Unknown metric {m!r}; expected one of {{'r2','rank_ic'}}."
+                    f"Unknown metric {m!r}; expected one of "
+                    f"{sorted(_VALID_METRICS)}."
                 )
             if m == "rank_ic" and t_arr is None:
                 continue  # silently dropped
             active_metrics.append(m)
+        _CLS_METRICS = {"precision", "f1", "auc", "logloss"}
 
         # ------------------------------------------------------------------
         # Walk the tree top-down to record the row indices that reach each
@@ -581,6 +589,8 @@ class PanelTreeEngine:
         per_node_metrics: Dict[int, Dict[str, float]] = {}
         rows: List[Dict[str, Any]] = []
 
+        cls_active = [m for m in active_metrics if m in _CLS_METRICS]
+
         def _metrics_for(
             node: PanelTreeNode, idx: np.ndarray
         ) -> Dict[str, float]:
@@ -591,6 +601,8 @@ class PanelTreeEngine:
                 if "rank_ic" in active_metrics:
                     out["oos_rank_ic_mean"] = float("nan")
                     out["oos_rank_ic_ir"] = float("nan")
+                for m in cls_active:
+                    out[f"oos_{m}"] = float("nan")
                 return out
             y_sub = y_arr[idx]
             y_pred = node.predictor.predict(X_arr[idx])
@@ -605,6 +617,23 @@ class PanelTreeEngine:
                 )
                 out["oos_rank_ic_mean"] = ic_mean
                 out["oos_rank_ic_ir"] = ic_ir
+            if cls_active:
+                # Use predictor probability output when available (true
+                # classifiers such as ``RidgeLogitClassifier``); otherwise fall
+                # back to the raw ``predict`` output, which the caller is
+                # responsible for ensuring lies in ``[0, 1]`` (e.g. a regressor
+                # already trained on binary targets).
+                if hasattr(node.predictor, "predict_proba"):
+                    proba = node.predictor.predict_proba(X_arr[idx])
+                else:
+                    proba = y_pred
+                cls_metrics = evaluate_classification(y_sub, proba)
+                for m in cls_active:
+                    v = cls_metrics.get(m, float("nan"))
+                    out[f"oos_{m}"] = (
+                        float(v) if v is not None and np.isfinite(v)
+                        else float("nan")
+                    )
             return out
 
         for node in nodes_in_order:
@@ -630,6 +659,8 @@ class PanelTreeEngine:
                 row["oos_rank_ic_ir"] = node_metrics.get(
                     "oos_rank_ic_ir", float("nan")
                 )
+            for m in cls_active:
+                row[f"oos_{m}"] = node_metrics.get(f"oos_{m}", float("nan"))
 
             # Child-difference columns for internal nodes.
             if not node.is_leaf and node.left is not None and node.right is not None:
@@ -651,6 +682,13 @@ class PanelTreeEngine:
                     row["left_oos_rank_ic_mean"] = l_ic
                     row["right_oos_rank_ic_mean"] = r_ic
                     row["delta_oos_rank_ic"] = float(l_ic - r_ic)
+                for m in cls_active:
+                    col_key = f"oos_{m}"
+                    l_v = lm.get(col_key, float("nan"))
+                    r_v = rm.get(col_key, float("nan"))
+                    row[f"left_oos_{m}"] = l_v
+                    row[f"right_oos_{m}"] = r_v
+                    row[f"delta_oos_{m}"] = float(l_v - r_v)
 
             rows.append(row)
 
@@ -734,9 +772,12 @@ class PanelTreeEngine:
         ----------
         X_val, y_val : DataFrame / Series-like
             Validation panel.
-        metric : {"r2", "rank_ic"}, default "r2"
-            Metric to maximise (root-node value).  ``"rank_ic"`` requires
-            ``time_col``.
+        metric : str, default "r2"
+            Metric to maximise (root-node value).  One of ``"r2"``,
+            ``"rank_ic"``, ``"precision"``, ``"f1"``, ``"auc"`` or
+            ``"logloss"``.  ``"rank_ic"`` requires ``time_col``.  Note that
+            ``logloss`` is minimised (lower is better) — internally we
+            *maximise* its negative so the same ``argmax`` logic applies.
         time_col, weights
             Forwarded to :meth:`evaluate`.
 
@@ -748,9 +789,10 @@ class PanelTreeEngine:
             ``alpha = 0`` row is the unpruned tree.
         """
         assert self.root_ is not None, "Call .fit() first."
-        if metric not in {"r2", "rank_ic"}:
+        _VALID = {"r2", "rank_ic", "precision", "f1", "auc", "logloss"}
+        if metric not in _VALID:
             raise ValueError(
-                f"metric must be 'r2' or 'rank_ic', got {metric!r}."
+                f"metric must be one of {sorted(_VALID)}, got {metric!r}."
             )
 
         path = self.cost_complexity_pruning_path()
@@ -758,16 +800,30 @@ class PanelTreeEngine:
 
         rows: List[Dict[str, Any]] = []
         # Metric column name in NodeEvalResult.per_node_df.
-        col = "oos_r2" if metric == "r2" else "oos_rank_ic_mean"
+        if metric == "r2":
+            col = "oos_r2"
+        elif metric == "rank_ic":
+            col = "oos_rank_ic_mean"
+        else:
+            col = f"oos_{metric}"
+        # Lower is better for ``logloss`` — flip the sign so the caller-facing
+        # "maximise root metric" rule still produces the most predictive tree.
+        sign = -1.0 if metric == "logloss" else 1.0
 
         for alpha in alphas:
             clone = copy.deepcopy(self)
             if alpha > 0:
                 clone.prune(float(alpha))
+            if metric == "rank_ic":
+                eval_metrics: Tuple[str, ...] = ("r2", "rank_ic")
+            elif metric in {"precision", "f1", "auc", "logloss"}:
+                eval_metrics = (metric,)
+            else:
+                eval_metrics = ("r2",)
             result = clone.evaluate(
                 X_val, y_val,
                 time_col=time_col,
-                metrics=("r2", "rank_ic") if metric == "rank_ic" else ("r2",),
+                metrics=eval_metrics,
                 weights=weights,
             )
             df = result.per_node_df
@@ -793,7 +849,11 @@ class PanelTreeEngine:
         if valid.empty:
             best_alpha = float(alphas[0])
         else:
-            best_alpha = float(curve.loc[valid.idxmax(), "ccp_alpha"])
+            # Logloss is "lower is better"; ``sign`` flips so the same argmax
+            # picks the most predictive tree regardless of metric direction.
+            best_alpha = float(
+                curve.loc[(sign * valid).idxmax(), "ccp_alpha"]
+            )
         return best_alpha, curve
 
     # ------------------------------------------------------------------
