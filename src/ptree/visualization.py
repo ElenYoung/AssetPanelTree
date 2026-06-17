@@ -50,6 +50,7 @@ _METRIC_DISPLAY = {
     "rank_ic_mean": "IC",
     "rank_ic_ir": "IR",
     "ir": "IR",
+    "sharpe": "Sharpe",
     "precision": "Prec",
     "f1": "F1",
     "auc": "AUC",
@@ -57,10 +58,18 @@ _METRIC_DISPLAY = {
 }
 
 # Keys included by default in node labels (text tree, graphviz, plot_tree).
-_DEFAULT_VISIBLE_METRICS = ("r2", "rank_ic_mean", "ir", "precision", "f1", "auc")
+# ``sharpe`` is included so :class:`MeanVarianceCriterion` users see the
+# leaf's long-short portfolio Sharpe directly in node labels.
+_DEFAULT_VISIBLE_METRICS = (
+    "r2", "rank_ic_mean", "ir", "sharpe",
+    "precision", "f1", "auc",
+)
 
 # Keys explicitly hidden by default (bookkeeping rather than diagnostic).
-_DEFAULT_HIDDEN_METRICS = {"n_samples", "n_features", "mse", "logloss"}
+_DEFAULT_HIDDEN_METRICS = {
+    "n_samples", "n_features", "mse", "logloss",
+    "port_mean", "port_vol", "_port_ret",
+}
 
 
 def _apply_mpl_style() -> None:
@@ -282,6 +291,8 @@ class NodeReporter:
                 )
             else:
                 bits.append(f"OOS IC={row['oos_rank_ic_mean']:+.{_DEC}f}")
+        if "oos_sharpe" in row and not pd.isna(row["oos_sharpe"]):
+            bits.append(f"OOS Sharpe={row['oos_sharpe']:+.{_DEC}f}")
         for key, disp in cls._OOS_CLS_COLS:
             col = f"oos_{key}"
             if col in row and not pd.isna(row[col]):
@@ -309,6 +320,13 @@ class NodeReporter:
             r = row.get("right_oos_rank_ic_mean", float("nan"))
             bits.append(
                 f"ΔIC={row['delta_oos_rank_ic']:+.{_DEC}f} "
+                f"(L={l:+.{_DEC}f} vs R={r:+.{_DEC}f})"
+            )
+        if "delta_oos_sharpe" in row and not pd.isna(row["delta_oos_sharpe"]):
+            l = row.get("left_oos_sharpe", float("nan"))
+            r = row.get("right_oos_sharpe", float("nan"))
+            bits.append(
+                f"ΔSharpe={row['delta_oos_sharpe']:+.{_DEC}f} "
                 f"(L={l:+.{_DEC}f} vs R={r:+.{_DEC}f})"
             )
         for key, disp in cls._OOS_CLS_COLS:
@@ -594,6 +612,7 @@ class NodeReporter:
                         "delta_oos_rank_ic"),
             "rank_ic_mean": ("rank_ic_mean", "oos_rank_ic_mean",
                              "delta_oos_rank_ic"),
+            "sharpe": ("sharpe", "oos_sharpe", "delta_oos_sharpe"),
             "precision": ("precision", "oos_precision", "delta_oos_precision"),
             "f1": ("f1", "oos_f1", "delta_oos_f1"),
             "auc": ("auc", "oos_auc", "delta_oos_auc"),
