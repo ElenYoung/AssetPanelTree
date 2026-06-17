@@ -27,7 +27,9 @@ from ptree import (
     R2DiffCriterion,
     RidgeRegressor,
 )
+from ptree.criteria import ClassificationCriterion
 from ptree.ensemble import _block_bootstrap_times
+from ptree.predictors import RidgeLogitClassifier
 
 
 # ----------------------------------------------------------------------
@@ -254,3 +256,128 @@ class TestPanelForest:
         preds = forest.predict(X)
         corr = np.corrcoef(preds, y.values)[0, 1]
         assert corr > 0.0
+
+
+# ----------------------------------------------------------------------
+# PanelForest — classification path
+# ----------------------------------------------------------------------
+
+def _make_classification_data(T: int = 40, N: int = 60, P: int = 6, seed: int = 7):
+    """Binary-label panel: the sign of a linear combination of features.
+
+    Produces ``y ∈ {0, 1}`` so that a classification forest (precision /
+    F1 / AUC criterion) has a well-defined target.
+    """
+    rng = np.random.default_rng(seed)
+    feature_names = [f"char_{i + 1}" for i in range(P)]
+    dates = np.repeat(np.arange(T), N)
+    asset_ids = np.tile(np.arange(N), T)
+    X_raw = rng.standard_normal((T * N, P))
+    logit = 0.8 * X_raw[:, 0] - 0.5 * X_raw[:, 1] + 0.3 * X_raw[:, 2]
+    p = 1.0 / (1.0 + np.exp(-logit))
+    y = (rng.uniform(size=T * N) < p).astype(np.float64)
+    df = pd.DataFrame(X_raw, columns=feature_names)
+    df["date"] = dates
+    df["asset_id"] = asset_ids
+    return df, pd.Series(y, name="up"), feature_names
+
+
+class TestPanelForestClassification:
+    """The forest should remain self-consistent under a classification criterion.
+
+    These tests pin the behaviour added when generalising P-Forest from the
+    R²-only "high-R² leaf" rule to ``criterion.metric_key()``: the
+    leaf-ranking, OOB scoring, and ``predict_proba`` paths must all behave
+    correctly when the criterion is precision-/F1-/AUC-based.
+    """
+
+    def _fit(self, criterion_metric: str = "precision", n_estimators: int = 8):
+        df, y, feats = _make_classification_data()
+        dh = DataHandler(cs_rank_standardize=True)
+        X_proc, y_proc, _ = dh.fit_transform(
+            df, y, time_col="date", entity_col="asset_id"
+        )
+        forest = PanelForest(
+            n_estimators=n_estimators,
+            max_features="sqrt",
+            block_size=5,
+            base_params=dict(
+                criterion=ClassificationCriterion(metric=criterion_metric),
+                # Predictor is intentionally NOT supplied so we exercise the
+                # task-aware default (logistic) in PanelForest.fit.
+                max_depth=3,
+                min_samples=150,
+            ),
+            random_state=0,
+            verbose=0,
+        )
+        forest.fit(X_proc, y_proc, feature_names=dh.feature_names, time_index="date")
+        return forest, X_proc, y_proc
+
+    def test_detects_classification_task(self):
+        """The fit should flag the forest as classification."""
+        forest, _, _ = self._fit()
+        assert forest.is_classification_ is True
+
+    def test_default_predictor_is_logistic_under_classification_criterion(self):
+        """Without an explicit predictor, the forest should pick a logistic one."""
+        forest, _, _ = self._fit()
+        leaves = forest.trees_[0].get_leaves()
+        # At least one leaf should hold a RidgeLogitClassifier (the default).
+        assert any(isinstance(leaf.predictor, RidgeLogitClassifier) for leaf in leaves)
+
+    def test_predict_returns_probabilities(self):
+        """Bagged prediction on a classification forest is P(y=1|X) ∈ [0, 1]."""
+        forest, X, y = self._fit()
+        p = forest.predict(X)
+        assert p.shape == (len(y),)
+        assert np.all(p >= 0.0) and np.all(p <= 1.0)
+        # Probabilities should at least be non-degenerate (not all equal).
+        assert p.std() > 0.0
+
+    def test_predict_proba_alias(self):
+        forest, X, _ = self._fit()
+        np.testing.assert_allclose(forest.predict_proba(X), forest.predict(X))
+
+    def test_predict_proba_unavailable_on_regression(self):
+        """The probability API is gated on classification."""
+        X, y, feats = _processed()
+        reg_forest = PanelForest(
+            n_estimators=4,
+            base_params=dict(max_depth=2, min_samples=200),
+            random_state=0,
+        ).fit(X, y, feature_names=feats, time_index="date")
+        with pytest.raises(AttributeError):
+            reg_forest.predict_proba(X)
+
+    def test_regime_membership_uses_criterion_metric(self):
+        """regime_membership must not silently degenerate to "all ones".
+
+        Under the old, R²-hardcoded implementation, classification forests
+        had no ``"r2"`` key in leaf.metrics → every leaf was considered
+        "high" → membership == 1 everywhere.  The fix should produce a
+        non-degenerate distribution.
+        """
+        forest, X, y = self._fit(n_estimators=10)
+        m = forest.regime_membership(X)
+        assert m.shape == (len(y),)
+        assert np.all(m >= 0.0) and np.all(m <= 1.0)
+        # Non-degenerate: at least *some* observations should sit below 1
+        # and above 0 (else the high-leaf set is trivially {all} or {}).
+        assert m.std() > 0.0
+        assert m.min() < 1.0
+
+    def test_oob_score_is_classification_metric(self):
+        """oob_score_ on a precision criterion should sit in [0, 1]."""
+        forest, _, _ = self._fit()
+        assert forest.oob_score_ is not None
+        assert np.isfinite(forest.oob_score_)
+        # Precision is bounded in [0, 1].
+        assert 0.0 <= forest.oob_score_ <= 1.0
+
+    def test_f1_criterion_also_works(self):
+        """Smoke test for an alternative classification criterion."""
+        forest, X, y = self._fit(criterion_metric="f1")
+        p = forest.predict(X)
+        assert np.all(np.isfinite(p))
+        assert forest.oob_score_ is not None and np.isfinite(forest.oob_score_)

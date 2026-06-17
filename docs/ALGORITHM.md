@@ -184,7 +184,59 @@ $$
 
 > 对应"二叉树 ↔ 随机森林"。源码：`ensemble.PanelForest`。
 
+### 5.0 Applicability Across Criteria (Regression *and* Classification)
+
+§5 的所有论述对**任何"越大越好"的叶子级指标**都成立——无论它是 $R^2$、Rank-IC、还是 Precision / F1 / AUC。这一节先把"P-Forest 只适配回归"的常见误解澄清掉，再展开细节。
+
+**算法层面为什么本就兼容**。§5.2 已说明：集成发生在**输出层**（分区、预测、组合），每棵树内部的切分准则**完全不变**。因此只要把后文里"高 $R^2$ 叶子"的定义抽象成：
+
+$$
+\mathcal H_b \;=\; \big\{\,\ell\ :\ \texttt{metric}_b(\ell)\ \ge\ \operatorname{median}_{\ell'\in\text{leaves}(b)}\ \texttt{metric}_b(\ell')\,\big\},
+$$
+
+其中 $\texttt{metric}$ 即 `criterion.metric_key()` 返回的指标（回归→`r2`，分类→`precision`/`f1`/`auc`），§5.4 ② 的 regime 隶属概率、§5.8 的"高可预测样本筛选"逻辑就**逐字成立**。
+
+**实现层面的对应改造**（`src/ptree/ensemble.py::PanelForest`）：
+
+| 组件 | 改造前 | 改造后（任务无关）|
+|------|--------|------------|
+| 高 $R^2$ 叶子集合 $\mathcal H_b$ | 硬编码 `leaf.metrics["r2"]` | 改读 `criterion.metric_key()`；分类下自动用 `"precision"` 等 |
+| `regime_membership` | 分类下叶子无 `"r2"` 键 → 退化为恒等于 1 | 严格在 $[0,1]$，非退化 |
+| 默认叶子 predictor | 总是 `RidgeRegressor` | 检测到分类准则时自动改用 `RidgeLogitClassifier` |
+| `predict` | 平均连续预测 | 分类下平均 `predict_proba` → 输出 $\widehat P(y{=}1\mid x)$ |
+| `predict_proba` | 不存在 | 新增；仅分类可用，回归调用抛异常 |
+| `oob_score_` | 总是 OOB $R^2$ | 回归→$R^2$；分类→`criterion.metric_key()`（precision/F1/AUC，`logloss` 取负号保持"越大越好"）|
+| `regime_metric` 参数枚举 | `{train_r2, oof_r2, rank_ic}` | 增加 `auto`（推荐别名）与 `precision/f1/auc/logloss` |
+
+**用户视角的最小改动**（以 `Precision` 为例）：
+
+```python
+from ptree.criteria import ClassificationCriterion
+from ptree.ensemble import PanelForest
+
+forest = PanelForest(
+    n_estimators=100,
+    base_params=dict(
+        criterion=ClassificationCriterion(metric="precision"),
+        # predictor 可省略 — Fit 时自动选 RidgeLogitClassifier
+        max_depth=3,
+        min_samples=150,
+    ),
+    random_state=0,
+).fit(X, y_binary, feature_names=feats, time_index="date")
+
+p_pos       = forest.predict_proba(X)        # 平均 P(y=1|X)
+p_high_prec = forest.regime_membership(X)    # "高 Precision regime" 概率
+C           = forest.coassociation_matrix()  # 共识矩阵（与准则无关）
+print(forest.oob_score_)                     # OOB Precision
+```
+
+**保留的局限**。`MeanVarianceCriterion`（§3.3）天然只对回归收益序列有定义；分类下不可用。`P-Boost`（§6）是**残差提升**，需要可加的回归目标；对 0/1 标签做残差提升并不等价于 GBDT-classification，目前 `BoostedPanelTree` 类的 docstring 已明确标注此局限——分类场景请用 `PanelForest`。
+
+后文 §5.1 ~ §5.8 保持以"高 $R^2$ 叶子 / R² 差"为叙述主线（兼顾原 paper 语境），但只要把它替换为 `criterion.metric_key()` 的对应指标，所有结论就自动覆盖分类。
+
 ### 5.1 Why P-Tree Especially Needs a Forest
+
 
 P-Tree 的贪心步骤"在 $p\times|\text{thresholds}|$ 个候选里挑 $\lvert R^2_L-R^2_R\rvert$ 最大者"是一个**高方差**的离散选择：数据轻微扰动就可能让胜出的 $(k^*,c^*)$ 翻转，从而得到**完全不同的分区**。这正是 bagging（自助聚合）最能发挥威力的场景——用扰动生成多棵去相关的树，再在输出层聚合以降方差。
 
