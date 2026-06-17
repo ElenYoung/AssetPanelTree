@@ -545,7 +545,13 @@ class PanelTreeEngine:
         # :func:`evaluate_classification` and so are usable with classification
         # criteria *and* with regression predictors whose ``predict`` output is
         # already in [0, 1] (e.g. when callers feed binary labels in ``y``).
-        _VALID_METRICS = {"r2", "rank_ic", "precision", "f1", "auc", "logloss"}
+        # ``sharpe`` is the per-node long-short portfolio Sharpe ratio used by
+        # :class:`MeanVarianceCriterion`; it requires ``time_col`` so each
+        # leaf can be aggregated into a per-time return series.
+        _VALID_METRICS = {
+            "r2", "rank_ic", "sharpe",
+            "precision", "f1", "auc", "logloss",
+        }
         requested = tuple(metrics)
         active_metrics: List[str] = []
         for m in requested:
@@ -556,8 +562,18 @@ class PanelTreeEngine:
                 )
             if m == "rank_ic" and t_arr is None:
                 continue  # silently dropped
+            if m == "sharpe" and t_arr is None:
+                # Sharpe is only well-defined per-time period; without time
+                # labels we silently drop it, matching the rank_ic policy.
+                continue
             active_metrics.append(m)
         _CLS_METRICS = {"precision", "f1", "auc", "logloss"}
+        sharpe_active = "sharpe" in active_metrics
+        # Annualisation factor for Sharpe — pulled from the criterion when
+        # available, else default to 1.0 (period Sharpe).
+        sharpe_ann = float(
+            getattr(self.criterion, "annualization", 1.0) or 1.0
+        )
 
         # ------------------------------------------------------------------
         # Walk the tree top-down to record the row indices that reach each
@@ -601,6 +617,8 @@ class PanelTreeEngine:
                 if "rank_ic" in active_metrics:
                     out["oos_rank_ic_mean"] = float("nan")
                     out["oos_rank_ic_ir"] = float("nan")
+                if sharpe_active:
+                    out["oos_sharpe"] = float("nan")
                 for m in cls_active:
                     out[f"oos_{m}"] = float("nan")
                 return out
@@ -617,6 +635,15 @@ class PanelTreeEngine:
                 )
                 out["oos_rank_ic_mean"] = ic_mean
                 out["oos_rank_ic_ir"] = ic_ir
+            if sharpe_active:
+                t_sub = t_arr[idx]
+                port = self._portfolio_returns(y_sub, y_pred, t_sub)
+                sr, _, _ = self._sharpe_stats(
+                    port, annualization=sharpe_ann
+                )
+                out["oos_sharpe"] = (
+                    float(sr) if np.isfinite(sr) else float("nan")
+                )
             if cls_active:
                 # Use predictor probability output when available (true
                 # classifiers such as ``RidgeLogitClassifier``); otherwise fall
@@ -659,6 +686,10 @@ class PanelTreeEngine:
                 row["oos_rank_ic_ir"] = node_metrics.get(
                     "oos_rank_ic_ir", float("nan")
                 )
+            if sharpe_active:
+                row["oos_sharpe"] = node_metrics.get(
+                    "oos_sharpe", float("nan")
+                )
             for m in cls_active:
                 row[f"oos_{m}"] = node_metrics.get(f"oos_{m}", float("nan"))
 
@@ -682,6 +713,12 @@ class PanelTreeEngine:
                     row["left_oos_rank_ic_mean"] = l_ic
                     row["right_oos_rank_ic_mean"] = r_ic
                     row["delta_oos_rank_ic"] = float(l_ic - r_ic)
+                if sharpe_active:
+                    l_sr = lm.get("oos_sharpe", float("nan"))
+                    r_sr = rm.get("oos_sharpe", float("nan"))
+                    row["left_oos_sharpe"] = l_sr
+                    row["right_oos_sharpe"] = r_sr
+                    row["delta_oos_sharpe"] = float(l_sr - r_sr)
                 for m in cls_active:
                     col_key = f"oos_{m}"
                     l_v = lm.get(col_key, float("nan"))
@@ -789,10 +826,18 @@ class PanelTreeEngine:
             ``alpha = 0`` row is the unpruned tree.
         """
         assert self.root_ is not None, "Call .fit() first."
-        _VALID = {"r2", "rank_ic", "precision", "f1", "auc", "logloss"}
+        _VALID = {
+            "r2", "rank_ic", "sharpe",
+            "precision", "f1", "auc", "logloss",
+        }
         if metric not in _VALID:
             raise ValueError(
                 f"metric must be one of {sorted(_VALID)}, got {metric!r}."
+            )
+        if metric == "sharpe" and time_col is None:
+            raise ValueError(
+                "metric='sharpe' requires `time_col` so each node's "
+                "long-short portfolio can be aggregated by time."
             )
 
         path = self.cost_complexity_pruning_path()
@@ -816,6 +861,8 @@ class PanelTreeEngine:
                 clone.prune(float(alpha))
             if metric == "rank_ic":
                 eval_metrics: Tuple[str, ...] = ("r2", "rank_ic")
+            elif metric == "sharpe":
+                eval_metrics = ("sharpe",)
             elif metric in {"precision", "f1", "auc", "logloss"}:
                 eval_metrics = (metric,)
             else:
@@ -1672,8 +1719,43 @@ class PanelTreeEngine:
             # the mean-variance criterion can evaluate the efficient-frontier
             # contribution of this (candidate) leaf.
             if self._needs_port_ret and time is not None:
-                metrics["_port_ret"] = self._portfolio_returns(y, y_pred, time)
+                port = self._portfolio_returns(y, y_pred, time)
+                metrics["_port_ret"] = port
+                # Also expose scalar Sharpe / mean / vol so node-level logging,
+                # reporting and downstream OOS evaluation can summarise the
+                # leaf's long-short portfolio directly (criterion.metric_key()
+                # returns "sharpe" for MeanVarianceCriterion).
+                ann = float(
+                    getattr(self.criterion, "annualization", 1.0) or 1.0
+                )
+                sr, mean, vol = self._sharpe_stats(port, annualization=ann)
+                metrics["sharpe"] = sr
+                metrics["port_mean"] = mean
+                metrics["port_vol"] = vol
         return metrics
+
+    @staticmethod
+    def _sharpe_stats(
+        port_ret: Dict[Any, float],
+        annualization: float = 1.0,
+    ) -> Tuple[float, float, float]:
+        """Compute ``(sharpe, mean, vol)`` of a per-time long-short series.
+
+        Sharpe is annualised by ``sqrt(annualization)`` to match the
+        :class:`MeanVarianceCriterion` convention.  Empty / zero-variance
+        series return ``(0.0, 0.0, 0.0)`` so callers can pass the result
+        directly into a DataFrame without ``NaN`` propagation.
+        """
+        if not port_ret:
+            return 0.0, 0.0, 0.0
+        arr = np.fromiter(port_ret.values(), dtype=np.float64)
+        if arr.size < 2:
+            return 0.0, float(arr.mean()) if arr.size else 0.0, 0.0
+        mean = float(arr.mean())
+        vol = float(arr.std(ddof=1))
+        if vol <= 1e-12:
+            return 0.0, mean, vol
+        return float(mean / vol * np.sqrt(annualization)), mean, vol
 
     @staticmethod
     def _portfolio_returns(
