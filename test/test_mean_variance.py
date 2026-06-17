@@ -95,8 +95,11 @@ class TestMeanVarianceCriterion:
         complementary = crit.calculate_score({"_port_ret": a}, {"_port_ret": b})
         assert complementary >= redundant
 
-    def test_metric_key_is_r2(self):
-        assert MeanVarianceCriterion().metric_key() == "r2"
+    def test_metric_key_is_sharpe(self):
+        # As of the M5 polish, MeanVarianceCriterion advertises ``sharpe``
+        # as its primary metric so visualisations / evaluate() show OOS
+        # Sharpe instead of OOS R².
+        assert MeanVarianceCriterion().metric_key() == "sharpe"
 
 
 # ----------------------------------------------------------------------
