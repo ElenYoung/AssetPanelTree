@@ -1,38 +1,35 @@
-# P-Tree API Reference / API 参考手册
+# P-Tree API Reference
 
-> **Scope / 范围.** This document is a *flat, dictionary-style reference* for every
+> **Scope.** This document is a *flat, dictionary-style reference* for every
 > public class, method, parameter and return value exposed by the `ptree`
 > package (`v0.3.x`). Use it as a lookup table; for conceptual background
 > see [`README.md`](../README.md) and for the algorithmic specification
 > see [`ALGORITHM.md`](ALGORITHM.md).
->
-> 本文档是 `ptree` 包（`v0.3.x`）所有公开类 / 方法 / 参数 / 返回值的**字典式查询手册**。
-> 概念背景见 [`README.md`](../README.md)；算法规范见 [`ALGORITHM.md`](ALGORITHM.md)。
 >
 > Every entry follows the same template:
 > *Signature → Purpose → Parameters → Returns → Example.*
 
 ---
 
-## Table of Contents / 目录
+## Table of Contents
 
-- [0. Overview & Cheat Sheet / 总览与速查表](#0-overview--cheat-sheet--总览与速查表)
-- [1. `DataHandler` / 数据预处理](#1-datahandler--数据预处理)
-- [2. Predictors / 叶子模型](#2-predictors--叶子模型)
-- [3. Criteria / 切分准则](#3-criteria--切分准则)
-- [4. `PanelTreeEngine` / 主引擎](#4-paneltreeengine--主引擎)
-- [5. `PanelTreeNode` / 节点对象](#5-paneltreenode--节点对象)
-- [6. `NodeEvalResult` / OOS 评估容器](#6-nodeevalresult--oos-评估容器)
-- [7. Ensembles / 集成方法](#7-ensembles--集成方法)
-- [8. Visualization / 可视化](#8-visualization--可视化)
-- [9. Logging / 日志](#9-logging--日志)
-- [10. Version Migration / 版本迁移](#10-version-migration--版本迁移)
+- [0. Overview & Cheat Sheet](#0-overview--cheat-sheet)
+- [1. `DataHandler`](#1-datahandler)
+- [2. Predictors](#2-predictors)
+- [3. Criteria](#3-criteria)
+- [4. `PanelTreeEngine`](#4-paneltreeengine)
+- [5. `PanelTreeNode`](#5-paneltreenode)
+- [6. `NodeEvalResult`](#6-nodeevalresult)
+- [7. Ensembles](#7-ensembles)
+- [8. Visualization](#8-visualization)
+- [9. Logging](#9-logging)
+- [10. Version Migration](#10-version-migration)
 
 ---
 
-## 0. Overview & Cheat Sheet / 总览与速查表
+## 0. Overview & Cheat Sheet
 
-### 0.1 Top-level imports / 顶层导入
+### 0.1 Top-level imports
 
 ```python
 from ptree import (
@@ -56,53 +53,53 @@ from ptree import (
 
 | Name | Description |
 |---|---|
-| `DataHandler` | Panel preprocessing: alignment, fillna, cross-sectional rank, vol weights / 面板预处理：对齐、缺失填充、截面秩标准化、波动率权重 |
-| `RidgeRegressor` | Closed-form L2 leaf regressor / 闭式 L2 岭回归 |
-| `VolWeightedRidgeRegressor` | Inverse-vol weighted Ridge / 逆波动率加权岭回归 |
-| `RidgeLogitClassifier` | IRLS-based Ridge logit (with `predict_proba`) / IRLS 岭逻辑回归 |
-| `ElasticNetRegressor` | L1+L2 coordinate descent / 弹性网络 |
-| `PLSRegressor` | NIPALS partial least squares / 偏最小二乘 |
-| `SelfDefinedPredictor` | User-defined leaf model template / 自定义叶子模型模板 |
-| `R2DiffCriterion` | `\|R²_L − R²_R\|` (default) / R² 差（默认） |
-| `WeightedR2DiffCriterion` | Balance + shrinkage stabilised R² diff / 稳健化 R² 差 |
-| `RankICDiffCriterion` | `\|IC_L − IC_R\|` (scale-free) / Rank-IC 差 |
-| `MeanVarianceCriterion` | Tangency-portfolio Sharpe of two children / 切线组合最大夏普 |
-| `ClassificationCriterion` | Classification metric diff / 分类指标差 |
-| `PanelTreeEngine` | The fit / predict / prune / evaluate engine / 主引擎 |
-| `PanelTreeNode` | Per-node metadata container / 节点元数据容器 |
-| `NodeEvalResult` | Per-node OOS metrics container / 逐节点 OOS 评估容器 |
-| `PanelForest` | Bagged ensemble (P-Forest) / 装袋集成 |
-| `BoostedPanelTree` | Residual-boosted ensemble (P-Boost) / 残差提升集成 |
-| `NodeReporter` | Text / DataFrame / Graphviz / mpl tree reports / 文本/表/图树形报告 |
-| `MosaicVisualizer` | Prediction-mosaic heatmap / 预测马赛克热力图 |
+| `DataHandler` | Panel preprocessing: alignment, fillna, cross-sectional rank, vol weights |
+| `RidgeRegressor` | Closed-form L2 leaf regressor |
+| `VolWeightedRidgeRegressor` | Inverse-vol weighted Ridge |
+| `RidgeLogitClassifier` | IRLS-based Ridge logit (with `predict_proba`) |
+| `ElasticNetRegressor` | L1+L2 coordinate descent |
+| `PLSRegressor` | NIPALS partial least squares |
+| `SelfDefinedPredictor` | User-defined leaf model template |
+| `R2DiffCriterion` | `\|R²_L − R²_R\|` (default) |
+| `WeightedR2DiffCriterion` | Balance + shrinkage stabilised R² diff |
+| `RankICDiffCriterion` | `\|IC_L − IC_R\|` (scale-free) |
+| `MeanVarianceCriterion` | Tangency-portfolio Sharpe of two children |
+| `ClassificationCriterion` | Classification metric diff |
+| `PanelTreeEngine` | The fit / predict / prune / evaluate engine |
+| `PanelTreeNode` | Per-node metadata container |
+| `NodeEvalResult` | Per-node OOS metrics container |
+| `PanelForest` | Bagged ensemble (P-Forest) |
+| `BoostedPanelTree` | Residual-boosted ensemble (P-Boost) |
+| `NodeReporter` | Text / DataFrame / Graphviz / mpl tree reports |
+| `MosaicVisualizer` | Prediction-mosaic heatmap |
 
-### 0.2 Task → API cheat sheet / 任务 → API 速查
+### 0.2 Task → API cheat sheet
 
 | I want to … | Call |
 |---|---|
-| Preprocess a raw `(date, asset_id, …)` DataFrame / 预处理原始面板 DataFrame | `DataHandler().fit_transform(...)` |
-| Build the tree / 训练一棵 P-Tree | `PanelTreeEngine(...).fit(X, y, feature_names=...)` |
-| Predict on new data / 在新数据上预测 | `engine.predict(X)` |
-| Route rows to leaf ids / 把每行路由到叶子 id | `engine.predict_leaves(X)` |
-| Get the root-to-leaf node id path / 取根→叶完整节点路径 | `engine.predict_node_path(X)` |
-| Compute per-node OOS R² / Rank-IC / Sharpe / 逐节点 OOS 指标 | `engine.evaluate(X_oos, y_oos, time_col=...)` |
-| Inspect every node as a DataFrame / 表格式查看所有节点 | `engine.get_node_report()` or `NodeReporter(engine).summary()` |
-| Inspect only leaves / 仅看叶子 | `NodeReporter(engine).leaf_summary()` |
-| Get the original sample indices in each leaf / 每个叶子原始样本 idx | `engine.get_leaf_samples()` |
-| Post-prune the tree / 剪枝 | `engine.prune(ccp_alpha)` / `engine.tune_ccp_alpha(...)` |
-| Build a tradeable SDF factor from leaves / 用叶子组合构造 SDF 因子 | `engine.build_sdf_factor(...)` |
-| Print a pretty text tree / 文本格式打印树 | `NodeReporter(engine).print_tree()` |
-| Export a Graphviz DOT diagram / 导出 Graphviz DOT | `NodeReporter(engine).to_graphviz()` |
-| Plot a matplotlib tree / matplotlib 树图 | `NodeReporter(engine).plot_tree()` |
-| Prediction mosaic / 预测马赛克 | `MosaicVisualizer(engine).build_mosaic(...)` → `plot_mosaic(...)` |
-| Soft regime probability via forest / 森林软 regime 概率 | `PanelForest(...).regime_membership(X)` |
-| Consensus similarity for clustering / 共识相似度矩阵 | `PanelForest(...).coassociation_matrix(X)` |
-| OOB validation R² / 袋外 R² | `PanelForest(...).oob_score_` |
-| Boosted (multi-layer) regime discovery / 分层弱 regime 揭示 | `BoostedPanelTree(...).fit(...).predict(...)` |
+| Preprocess a raw `(date, asset_id, …)` DataFrame | `DataHandler().fit_transform(...)` |
+| Build the tree | `PanelTreeEngine(...).fit(X, y, feature_names=...)` |
+| Predict on new data | `engine.predict(X)` |
+| Route rows to leaf ids | `engine.predict_leaves(X)` |
+| Get the root-to-leaf node id path | `engine.predict_node_path(X)` |
+| Compute per-node OOS R² / Rank-IC / Sharpe | `engine.evaluate(X_oos, y_oos, time_col=...)` |
+| Inspect every node as a DataFrame | `engine.get_node_report()` or `NodeReporter(engine).summary()` |
+| Inspect only leaves | `NodeReporter(engine).leaf_summary()` |
+| Get the original sample indices in each leaf | `engine.get_leaf_samples()` |
+| Post-prune the tree | `engine.prune(ccp_alpha)` / `engine.tune_ccp_alpha(...)` |
+| Build a tradeable SDF factor from leaves | `engine.build_sdf_factor(...)` |
+| Print a pretty text tree | `NodeReporter(engine).print_tree()` |
+| Export a Graphviz DOT diagram | `NodeReporter(engine).to_graphviz()` |
+| Plot a matplotlib tree | `NodeReporter(engine).plot_tree()` |
+| Prediction mosaic | `MosaicVisualizer(engine).build_mosaic(...)` → `plot_mosaic(...)` |
+| Soft regime probability via forest | `PanelForest(...).regime_membership(X)` |
+| Consensus similarity for clustering | `PanelForest(...).coassociation_matrix(X)` |
+| OOB validation R² | `PanelForest(...).oob_score_` |
+| Boosted (multi-layer) regime discovery | `BoostedPanelTree(...).fit(...).predict(...)` |
 
 ---
 
-## 1. `DataHandler` / 数据预处理
+## 1. `DataHandler`
 
 Module: `ptree.data_handler`
 
@@ -123,14 +120,12 @@ DataHandler(
 Panel preprocessing: align `(X, y)`, fill missing values, optionally
 cross-sectionally rank-standardise features to `[0, 1]`, and (optionally)
 compute inverse-volatility weights from a return series.
-面板预处理：对齐 `(X, y)`、填充缺失、可选地把特征按截面秩归一到 `[0, 1]`、并可基于
-收益序列计算逆波动率权重。
 
 | Param | Type | Default | Meaning |
 |---|---|---|---|
-| `cs_rank_standardize` | `bool` | `True` | Apply per-cross-section rank → `[0,1]` mapping / 每个时间截面内做秩归一 |
-| `vol_window` | `int` | `60` | Rolling window for realised volatility / 波动率滚动窗口 |
-| `min_obs` | `int` | `20` | Min non-NaN obs to produce a vol value / 计算波动率所需最小观测数 |
+| `cs_rank_standardize` | `bool` | `True` | Apply per-cross-section rank → `[0,1]` mapping |
+| `vol_window` | `int` | `60` | Rolling window for realised volatility |
+| `min_obs` | `int` | `20` | Min non-NaN obs to produce a vol value |
 | `fillna_method` | `str` or `None` | `"ffill"` | One of `"ffill" / "bfill" / "zero" / "mean" / None` |
 
 ### 1.2 `DataHandler.fit`
@@ -146,7 +141,6 @@ fit(
 
 Learn feature-column metadata. `X` must contain `time_col` and `entity_col`
 either as columns or as named MultiIndex levels.
-学习特征列元数据。`X` 必须包含 `time_col` 与 `entity_col`（列或具名 MultiIndex 层均可）。
 
 ### 1.3 `DataHandler.transform`
 
@@ -159,13 +153,12 @@ transform(
 ```
 
 Apply the pipeline.
-应用预处理流水线。
 
 **Returns**
 - `X_processed`: cleaned (and optionally rank-standardised) feature panel,
-  retains `time_col`/`entity_col` columns. / 清洗后的特征面板。
-- `y_processed`: target aligned with `X_processed`. / 与 X 对齐后的目标。
-- `vol_weights`: inverse-vol weights (`1/σ`) or `None`. / 逆波动率权重或 `None`。
+  retains `time_col`/`entity_col` columns.
+- `y_processed`: target aligned with `X_processed`.
+- `vol_weights`: inverse-vol weights (`1/σ`) or `None`.
 
 ### 1.4 `DataHandler.fit_transform`
 
@@ -174,7 +167,7 @@ fit_transform(X, y, time_col="date", entity_col="asset_id",
               ret_series_for_vol=None) -> (X_proc, y_proc, vol_weights)
 ```
 
-Convenience wrapper: `fit` then `transform`. / `fit` + `transform` 的快捷调用。
+Convenience wrapper: `fit` then `transform`.
 
 ### 1.5 Property `feature_names`
 
@@ -183,7 +176,6 @@ dh.feature_names  # -> List[str]
 ```
 
 Feature column names learnt during `fit` (excludes `time_col`/`entity_col`).
-`fit` 学到的特征列名（不含时间 / 实体列）。
 
 ### 1.6 Example
 
@@ -201,12 +193,11 @@ print(dh.feature_names)
 
 ---
 
-## 2. Predictors / 叶子模型
+## 2. Predictors
 
 Module: `ptree.predictors`. All predictors inherit from `PredictorBase`.
-所有 predictor 均继承自 `PredictorBase`。
 
-### 2.1 `PredictorBase` (abstract / 抽象基类)
+### 2.1 `PredictorBase` (abstract)
 
 ```python
 class PredictorBase(ABC):
@@ -224,7 +215,7 @@ class PredictorBase(ABC):
 
 | Method | Returns | Notes |
 |---|---|---|
-| `fit(X, y, weights=None)` | `self` | Weights are optional; closed-form predictors also accept cached `XtWX`/`XtWy` via keyword arguments. / 权重可选；闭式 predictor 还接受 `XtWX`/`XtWy` 关键字以做增量更新。 |
+| `fit(X, y, weights=None)` | `self` | Weights are optional; closed-form predictors also accept cached `XtWX`/`XtWy` via keyword arguments for incremental updates. |
 | `predict(X)` | `ndarray` shape `(n,)` | — |
 | `get_coefficients()` | coefficient vector or `None` | — |
 | `get_intercept()` | intercept or `None` | — |
@@ -238,12 +229,11 @@ RidgeRegressor(alpha: float = 1.0, fit_intercept: bool = True)
 
 Closed-form L2-regularised linear regression: β = (XᵀWX + αI)⁻¹ XᵀWy.
 Uses SciPy Cholesky when available, falls back to NumPy `solve`/`lstsq`.
-闭式岭回归；优先用 SciPy Cholesky，回退 NumPy。
 
 | Param | Type | Default | Meaning |
 |---|---|---|---|
-| `alpha` | `float` | `1.0` | L2 regularisation / L2 强度 |
-| `fit_intercept` | `bool` | `True` | Prepend a constant column / 是否拟合截距 |
+| `alpha` | `float` | `1.0` | L2 regularisation strength |
+| `fit_intercept` | `bool` | `True` | Prepend a constant column |
 
 ### 2.3 `VolWeightedRidgeRegressor`
 
@@ -254,7 +244,6 @@ VolWeightedRidgeRegressor(alpha: float = 1.0, fit_intercept: bool = True)
 Same closed form as `RidgeRegressor`, expected to be called with
 inverse-vol weights (`1/σ`). The `weights` argument is what carries the
 heteroscedasticity correction.
-与 `RidgeRegressor` 公式一致，但期望以 `1/σ` 作为 `weights`，以缓解异方差。
 
 ### 2.4 `RidgeLogitClassifier`
 
@@ -272,8 +261,6 @@ L2-regularised logistic regression via Iteratively Reweighted Least Squares
 - `predict_proba(X) -> ndarray` — `P(y=1|X)`
 - `predict(X) -> ndarray` — hard 0/1 labels at threshold `0.5`.
 
-IRLS 岭逻辑回归。除常规 `fit/predict` 外，额外提供 `predict_proba`（`P(y=1|X)`）。
-
 ### 2.5 `ElasticNetRegressor`
 
 ```python
@@ -289,7 +276,6 @@ ElasticNetRegressor(
 Coordinate-descent L1+L2 regression. Useful for sparse factor selection on
 highly correlated characteristics. Does **not** participate in the engine's
 incremental sufficient-statistic fast path.
-坐标下降弹性网络。不参与引擎的增量统计量加速路径。
 
 ### 2.6 `PLSRegressor`
 
@@ -299,13 +285,11 @@ PLSRegressor(n_components: int = 2, fit_intercept: bool = True)
 
 NIPALS single-response partial least squares. Effective when characteristics
 are strongly collinear. Also bypasses the incremental fast path.
-NIPALS 偏最小二乘（单响应）。对强共线性因子有效，同样不参与增量加速。
 
 ### 2.7 `SelfDefinedPredictor`
 
 Template base class — subclass it, implement `fit` and `predict`, and pass an
 instance to `PanelTreeEngine(predictor=...)`.
-用户自定义模板：继承后实现 `fit` 与 `predict`，把实例传给 `PanelTreeEngine`。
 
 ```python
 from ptree import SelfDefinedPredictor
@@ -321,13 +305,12 @@ class MyLGBPredictor(SelfDefinedPredictor):
 
 ---
 
-## 3. Criteria / 切分准则
+## 3. Criteria
 
 Module: `ptree.criteria`. All criteria implement `calculate_score` and
 `metric_key`.
-所有准则实现 `calculate_score` 与 `metric_key`。
 
-### 3.1 `CriterionBase` (abstract / 抽象)
+### 3.1 `CriterionBase` (abstract)
 
 ```python
 class CriterionBase(ABC):
@@ -340,7 +323,6 @@ class CriterionBase(ABC):
 `metric_key()` is the *primary metric* the engine, `NodeReporter` and
 `PanelForest` use to summarise / rank leaves. Returns one of
 `"r2" / "rank_ic" / "sharpe" / "precision" / "f1" / "auc" / "logloss"`.
-`metric_key()` 决定 engine / 报告 / 森林如何汇总叶子，取值见上。
 
 ### 3.2 `R2DiffCriterion`
 
@@ -350,7 +332,6 @@ R2DiffCriterion(weight_by_size: bool = False)
 
 Score: `score = |R²_L − R²_R|` (default), optionally multiplied by
 `min(n_L, n_R) / (n_L + n_R)`.
-打分 = `|R²_L − R²_R|`，可选乘平衡项。
 
 - `metric_key() → "r2"`.
 
@@ -366,7 +347,6 @@ WeightedR2DiffCriterion(
 ```
 
 Stabilised R² diff for noisy panels.
-为低信噪比面板设计的稳健 R² 差。
 
 `score = |R²_L − R²_R| · balance · shrinkage`, with
 balance = `min(n_L,n_R)/(n_L+n_R)`, shrinkage = `(n_min−1)/(n_min−1+k)`.
@@ -375,10 +355,10 @@ sliver splits score `0`.
 
 | Param | Default | Meaning |
 |---|---|---|
-| `balance` | `True` | Apply the balance penalty / 是否乘平衡项 |
-| `shrinkage_k` | `0.0` | Sample-size shrinkage strength / 样本量收缩强度 |
-| `use_adjusted_r2` | `False` | Use adjusted-R² with `n_features` / 用调整 R² |
-| `min_child_weight` | `0.0` | Hard sample-share floor on smaller child / 较小子节点的样本占比硬下限 |
+| `balance` | `True` | Apply the balance penalty |
+| `shrinkage_k` | `0.0` | Sample-size shrinkage strength |
+| `use_adjusted_r2` | `False` | Use adjusted-R² with `n_features` |
+| `min_child_weight` | `0.0` | Hard sample-share floor on smaller child |
 
 - `metric_key() → "r2"`.
 
@@ -397,10 +377,8 @@ robust on low-SNR / non-Gaussian targets.
 **Requires `fit(..., time_index=...)`** so the engine can build the per-time
 series payload `"_rank_ic_series"` attached to each child's metrics.
 
-低信噪比时推荐使用。需在 `fit` 中传 `time_index`。
-
 - `metric_key() → "r2"` (kept for node logging; the criterion actually
-  operates on the per-time series payload). / 节点显示沿用 `"r2"`，但实际打分作用于时序载荷。
+  operates on the per-time series payload).
 
 ### 3.5 `MeanVarianceCriterion`
 
@@ -417,10 +395,9 @@ return series, `score = √(μᵀΣ⁻¹μ) · √A`. Aligns the splitting objec
 the *efficient-frontier* goal.
 **Requires `fit(..., time_index=...)`** so the engine can construct the
 `"_port_ret"` payload.
-打分 = 两侧多空组合切线组合年化夏普；需 `time_index`。
 
 - `metric_key() → "sharpe"` (each leaf's long-short Sharpe is stored in
-  `node.metrics["sharpe"]`). / 每个叶子的多空夏普写入 `node.metrics["sharpe"]`。
+  `node.metrics["sharpe"]`).
 
 ### 3.6 `ClassificationCriterion`
 
@@ -433,7 +410,7 @@ ClassificationCriterion(
 
 `score = |metric_L − metric_R|`. `metric_key()` returns the chosen `metric`.
 
-### 3.7 Helper functions / 辅助函数
+### 3.7 Helper functions
 
 | Function | Returns |
 |---|---|
@@ -442,11 +419,10 @@ ClassificationCriterion(
 
 These are usually called by the engine internally; you can also call them
 directly for ad-hoc metric computation.
-一般由 engine 内部调用，亦可独立用作即席指标计算。
 
 ---
 
-## 4. `PanelTreeEngine` / 主引擎
+## 4. `PanelTreeEngine`
 
 Module: `ptree.engine`.
 
@@ -484,17 +460,17 @@ Parameters grouped by role:
 
 | Param | Default | Meaning |
 |---|---|---|
-| `predictor` | `RidgeRegressor` | Leaf-model class or instance. If a class, instantiated with `predictor_params`. / 叶子模型类或实例 |
-| `criterion` | `R2DiffCriterion()` | Splitting criterion / 切分准则 |
-| `max_depth` | `3` | Max tree depth / 最大深度 |
-| `min_samples` | `100` | Min samples for a node to be splittable / 节点可分裂所需的最小样本数 |
-| `min_impurity_decrease` | `0.0` | Best-split score floor / 最优切分分阈值；不达则成叶 |
+| `predictor` | `RidgeRegressor` | Leaf-model class or instance. If a class, instantiated with `predictor_params`. |
+| `criterion` | `R2DiffCriterion()` | Splitting criterion |
+| `max_depth` | `3` | Max tree depth |
+| `min_samples` | `100` | Min samples for a node to be splittable |
+| `min_impurity_decrease` | `0.0` | Best-split score floor; below this the node becomes a leaf |
 
 **Threshold search**
 
 | Param | Default | Meaning |
 |---|---|---|
-| `split_thresholds` | `[0.3, 0.5, 0.7]` | Global fixed list, *or* `"adaptive"` for per-node quantile thresholds / 全局固定列表，或 `"adaptive"` 使用节点分位 |
+| `split_thresholds` | `[0.3, 0.5, 0.7]` | Global fixed list, *or* `"adaptive"` for per-node quantile thresholds |
 | `adaptive_quantiles` | `[0.25, 0.5, 0.75]` | Quantiles used when `split_thresholds="adaptive"` |
 | `splitter` | `"best"` | `"best"` = exhaustive; `"random"` = Extra-Trees random thresholds |
 | `n_random_splits` | `1` | Random thresholds per feature when `splitter="random"` |
@@ -504,27 +480,27 @@ Parameters grouped by role:
 
 | Param | Default | Meaning |
 |---|---|---|
-| `honest` | `False` | Enable honest split (fit-set + eval-set partition inside each node) / 启用诚实切分 |
+| `honest` | `False` | Enable honest split (fit-set + eval-set partition inside each node) |
 | `honest_frac` | `0.5` | Fraction held out as eval-set in `(0, 1)` |
 | `honest_refit_full` | `True` | After choosing the split, refit leaf models on the full sample |
-| `random_state` | `None` | Seed for honest split, random splitter and feature subset / 随机种子（控制诚实切分、随机阈值、随机特征子集） |
+| `random_state` | `None` | Seed for honest split, random splitter and feature subset |
 
 **Performance**
 
 | Param | Default | Meaning |
 |---|---|---|
-| `fast_mode` | `False` | Feature-priority caching from parent / 父节点特征优先级缓存 |
+| `fast_mode` | `False` | Feature-priority caching from parent |
 | `early_stopping_threshold` | `None` | Early-stop feature loop when best ≥ threshold (requires `fast_mode`) |
-| `n_jobs` | `1` | Feature-dim parallel workers (`-1` = all cores) / 特征维并行 |
+| `n_jobs` | `1` | Feature-dim parallel workers (`-1` = all cores) |
 | `parallel_backend` | `"threads"` | joblib backend: `"threads"` or `"processes"` |
-| `keep_node_stats` | `False` | Keep per-node cached `XtWX/XtWy` after splitting / 是否保留节点统计量 |
+| `keep_node_stats` | `False` | Keep per-node cached `XtWX/XtWy` after splitting |
 
 **Logging**
 
 | Param | Default | Meaning |
 |---|---|---|
 | `verbose` | `1` | `0` = silent, `1` = per-level, `2` = per-candidate |
-| `predictor_params` | `None` | Used only when `predictor` is a class, to instantiate it / 仅当 `predictor` 为类时使用 |
+| `predictor_params` | `None` | Used only when `predictor` is a class, to instantiate it |
 
 ### 4.2 `fit`
 
@@ -543,9 +519,6 @@ Build the tree. **`time_index` is required** when `criterion` is
 it is also necessary for `RankICDiffCriterion` to produce the per-time
 series payload. A `str` is treated as a column name in `X`.
 
-构建树。当准则为 `MeanVarianceCriterion` / `RankICDiffCriterion` 时
-**必须**传入 `time_index`。
-
 **Returns**: `self` (chaining).
 
 ### 4.3 Prediction APIs
@@ -557,7 +530,6 @@ predict(X: pd.DataFrame) -> np.ndarray  # shape (n,)
 ```
 
 Route each row to its leaf and apply the leaf's predictor.
-对每行路由到叶子并调用叶子的 predictor。
 
 #### `engine.predict_leaves(X)`
 
@@ -566,7 +538,6 @@ predict_leaves(X: pd.DataFrame) -> np.ndarray[int]  # shape (n,)
 ```
 
 Return the leaf `node_id` each row falls into.
-返回每行所在叶子的 `node_id`。
 
 #### `engine.predict_node_path(X)`
 
@@ -576,7 +547,6 @@ predict_node_path(X: pd.DataFrame) -> List[List[int]]
 
 For each row, the ordered list of `node_id`s from root to leaf — useful for
 explaining a specific prediction.
-每行返回根到叶完整的 `node_id` 序列，用于解释单个预测。
 
 ```python
 paths = engine.predict_node_path(X.head(3))
@@ -599,15 +569,13 @@ Compute OOS metrics for *every* node (internal + leaf). Internal-node pools
 are built by merging the children's pools so leaf and internal rows are
 directly comparable.
 
-对每个节点（含内部节点与叶子）计算 OOS 指标。内部节点的样本池由左右孩子样本合并而来。
-
 | Param | Notes |
 |---|---|
 | `time_col` | Required for `"rank_ic"` and `"sharpe"`; silently dropped otherwise. `str` → column name in `X`. |
 | `metrics` | Subset of `{"r2","rank_ic","sharpe","precision","f1","auc","logloss"}`. |
 | `weights` | Forwarded to weighted R². |
 
-**Returns**: a [`NodeEvalResult`](#6-nodeevalresult--oos-评估容器).
+**Returns**: a [`NodeEvalResult`](#6-nodeevalresult).
 
 ```python
 result = engine.evaluate(X_oos, y_oos, time_col="date",
@@ -620,20 +588,20 @@ print(reporter.print_tree(evaluation=result, show_child_diff=True))
 
 | Method | Returns |
 |---|---|
-| `engine.get_leaves()` | `List[PanelTreeNode]` — all leaves / 所有叶子 |
-| `engine.get_all_nodes()` | `List[PanelTreeNode]` — BFS order / BFS 顺序所有节点 |
-| `engine.get_node_report()` | `pd.DataFrame` — one row per node (see schema below) / 每节点一行的 DataFrame |
-| `engine.get_leaf_samples()` | `Dict[int, np.ndarray]` — leaf id → row indices / 叶子 id → 原始行索引 |
+| `engine.get_leaves()` | `List[PanelTreeNode]` — all leaves |
+| `engine.get_all_nodes()` | `List[PanelTreeNode]` — BFS order |
+| `engine.get_node_report()` | `pd.DataFrame` — one row per node (see schema below) |
+| `engine.get_leaf_samples()` | `Dict[int, np.ndarray]` — leaf id → row indices |
 
 `get_node_report()` columns:
 
 | Column | Description |
 |---|---|
-| `Node_ID` | Node id / 节点 id |
-| `Depth` | Depth, root = 0 / 深度，根为 0 |
-| `Rule` | Path rule string `"root & x1 < 0.5 & x3 >= 0.7"` / 路径规则字符串 |
+| `Node_ID` | Node id |
+| `Depth` | Depth, root = 0 |
+| `Rule` | Path rule string `"root & x1 < 0.5 & x3 >= 0.7"` |
 | `Is_Leaf` | `bool` |
-| `N_Samples` | In-node sample count / 节点样本数 |
+| `N_Samples` | In-node sample count |
 | `Sample_Ratio` | `N_Samples / total` |
 | `Split_Feature` | Split feature name (NaN for leaves) |
 | `Split_Threshold` | Split threshold value |
@@ -656,7 +624,6 @@ Bottom-up cost-complexity pruning *in place*. A subtree at node $v$ is
 collapsed when its cumulative split-score gain does not exceed
 `ccp_alpha · (n_leaves(v) − 1)`. Leaf predictors are retained, so
 `predict` keeps working.
-原位剪枝。
 
 #### `engine.cost_complexity_pruning_path()`
 
@@ -683,7 +650,6 @@ tune_ccp_alpha(
 Sweep `ccp_alpha` along the weakest-link path, evaluate each pruned tree on
 `(X_val, y_val)` via `evaluate`, and return the alpha maximising the root
 OOS metric. `logloss` is treated as "smaller is better" internally.
-沿弱链路径扫 `ccp_alpha`，挑使根节点 OOS 指标最优的 α。`logloss` 自动反号。
 
 **Returns**: `(best_alpha, curve_df)` where `curve_df` has columns
 `ccp_alpha`, `n_leaves`, `oos_<metric>`.
@@ -706,9 +672,6 @@ Factor portfolio realising the "growing the efficient frontier" goal.
 If `X` is `None`, the training data passed to `fit` is reused (`fit` must
 have been called with `time_index`).
 
-把所有叶子多空组合按切线权重 `w ∝ Σ⁻¹μ` 组合成单一 SDF 因子。
-当 `X=None` 时复用训练数据。
-
 **Returns** (dict):
 
 | Key | Type | Meaning |
@@ -726,7 +689,7 @@ print(sdf["sharpe"], sdf["weights"])
 
 ---
 
-## 5. `PanelTreeNode` / 节点对象
+## 5. `PanelTreeNode`
 
 Module: `ptree.node`. Returned by `engine.get_leaves()` / `get_all_nodes()`.
 
@@ -747,7 +710,7 @@ Module: `ptree.node`. Returned by `engine.get_leaves()` / `get_all_nodes()`.
 | `predictor` | `PredictorBase` or `None` | Trained leaf model |
 | `sample_ratio` | `float` | Coverage of total samples |
 | `elapsed_time` | `float` | Seconds spent building this node |
-| `n_samples` (property) | `int` | Samples in this node — *survives* pickling without `sample_indices`. / 持久化后仍可用 |
+| `n_samples` (property) | `int` | Samples in this node — *survives* pickling without `sample_indices`. |
 | `feature_ranking` | `list[tuple]` or `None` | `(feature, threshold, score)` for child priority caching |
 | `honest_n_samples` | `int` or `None` | Eval-set size when `honest=True` |
 
@@ -770,7 +733,7 @@ for name, w in zip(dh.feature_names, leaf.get_model_weights()):
 
 ---
 
-## 6. `NodeEvalResult` / OOS 评估容器
+## 6. `NodeEvalResult`
 
 Module: `ptree.engine`. The return type of `engine.evaluate(...)`.
 
@@ -811,7 +774,7 @@ dot = NodeReporter(engine).to_graphviz(evaluation=result, show_child_diff=True)
 
 ---
 
-## 7. Ensembles / 集成方法
+## 7. Ensembles
 
 Module: `ptree.ensemble`.
 
@@ -837,14 +800,12 @@ random feature subset**. Task-agnostic: a regression criterion in
 `base_params` gives a regression forest with Ridge leaves; a
 classification criterion auto-switches the default leaf predictor to
 `RidgeLogitClassifier`.
-基于时间块自助和节点随机特征子集的 P-Forest。
-回归 / 分类自动适配（按 `base_params["criterion"]` 探测）。
 
 | Param | Meaning |
 |---|---|
-| `n_estimators` | Number of trees / 树数 |
+| `n_estimators` | Number of trees |
 | `max_features` | Random feature subset size per node (decorrelation) |
-| `block_size` | Consecutive time periods per bootstrap block — should bracket the target's autocorrelation horizon / 时间块长度 |
+| `block_size` | Consecutive time periods per bootstrap block — should bracket the target's autocorrelation horizon |
 | `aggregate` | Default `output()` mode: `"mean"` → bagged prediction, `"consensus"` → co-association matrix, `"sdf"` → regime membership |
 | `base_params` | Forwarded to each `PanelTreeEngine`. `criterion` defaults to `R2DiffCriterion()`; `predictor` auto-set per task. |
 | `regime_metric` | How leaves get ranked into the "high-predictability" set for `regime_membership`. `"train_r2"` / `"auto"` → `criterion.metric_key()`. |
@@ -872,7 +833,6 @@ fit(
 
 **`time_index` is mandatory** — the block bootstrap operates on time
 periods. A `str` is read as a column of `X`.
-**`time_index` 必传**。
 
 #### `forest.predict(X)`
 
@@ -882,7 +842,6 @@ predict(X: pd.DataFrame) -> np.ndarray   # shape (n,)
 
 Bagged mean prediction. For classification this is the bagged `P(y=1|X)`
 (averages `predict_proba` when available, else 0/1 labels).
-装袋平均预测；分类情况下为 `P(y=1|X)`。
 
 #### `forest.predict_proba(X)`
 
@@ -891,7 +850,6 @@ predict_proba(X: pd.DataFrame) -> np.ndarray
 ```
 
 Classification-only alias of `predict`. Raises on a regression forest.
-仅分类森林可用。
 
 #### `forest.regime_membership(X)`
 
@@ -907,8 +865,6 @@ config).
 This is the **soft mosaic** — the forest-level upgrade of a single tree's
 brittle 0/1 high-R² indicator.
 
-返回每个样本被森林路由进高指标叶子的树占比，是单树硬规则的「软马赛克」对应物。
-
 ```python
 p = forest.regime_membership(X)
 X_high = X[p > 0.7]                       # samples deemed "high-predictability"
@@ -923,7 +879,6 @@ coassociation_matrix(X: Optional[pd.DataFrame] = None) -> np.ndarray   # (n, n)
 `C[i, j]` = fraction of trees in which rows `i, j` land in the same leaf.
 A robust task-agnostic similarity, usable as a precomputed affinity for
 spectral clustering. **Memory is O(n²)** — keep `n` modest.
-样本两两共叶频率；O(n²) 内存。
 
 #### `forest.output(X)`
 
@@ -949,11 +904,10 @@ BoostedPanelTree(
 Forward-stagewise residual boosting: each round refits a fresh shallow
 P-Tree on the *residual* of the running ensemble. The split criterion of
 each tree is unchanged (defaults to `R2DiffCriterion`).
-前向分步残差提升；每轮在残差上重新训练浅 P-Tree。
 
-> **Regression only / 仅限回归任务.** Applying it to 0/1 labels with a
-> classification criterion does *not* yield GBDT-classification. For
-> classification use `PanelForest`.
+> **Regression only.** Applying it to 0/1 labels with a classification
+> criterion does *not* yield GBDT-classification. For classification use
+> `PanelForest`.
 
 #### `boost.fit`
 
@@ -979,12 +933,12 @@ Returns `ν · Σ_m T_m.predict(X)`.
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `trees_` | `List[PanelTreeEngine]` | Layer-by-layer trees / 逐层弱学习器 |
-| `residual_norms_` | `List[float]` | `‖residual‖₂` per round; monotone ↓ then plateaus on self-limited data / 每轮残差 L2 范数 |
+| `trees_` | `List[PanelTreeEngine]` | Layer-by-layer trees |
+| `residual_norms_` | `List[float]` | `‖residual‖₂` per round; monotone ↓ then plateaus on self-limited data |
 
 ---
 
-## 8. Visualization / 可视化
+## 8. Visualization
 
 Module: `ptree.visualization`. Two classes — `NodeReporter` (tree summaries)
 and `MosaicVisualizer` (prediction mosaic).
@@ -1018,7 +972,6 @@ Box-drawing text tree (`│ ├── └──`). When `evaluation` is supplied
 node is augmented with OOS metrics (`n_oos`, `OOS R²`, `OOS IC (IR=...)`,
 `OOS Sharpe`, `OOS Prec/F1/AUC/LogLoss`). When `show_child_diff=True`, an
 extra `↳ split gain | ΔR²=...` line is inserted under each internal node.
-文本树。`evaluation` 注入 OOS 指标，`show_child_diff` 在内部节点下增加 Δ 行。
 
 ```python
 print(reporter.print_tree(evaluation=result, show_child_diff=True))
@@ -1051,7 +1004,6 @@ to_graphviz(
 
 Return Graphviz DOT source. The Graphviz Python package is *not* required
 to obtain the source string, only to render it.
-返回 Graphviz DOT 源码字符串。
 
 ```python
 dot = reporter.to_graphviz()
@@ -1078,7 +1030,6 @@ plot_tree(
 Pure-matplotlib tree diagram, no Graphviz binary needed. Each node box
 shows up to four rows: header, split rule (internal nodes only),
 `n = …`, IS criterion metric, OOS / Δ criterion metric.
-纯 matplotlib 树图，无需 Graphviz。
 
 ### 8.2 `MosaicVisualizer`
 
@@ -1134,7 +1085,6 @@ plot_mosaic(
 Render the mosaic via seaborn heatmap. When `cmap` is left `None`, a
 sensible default is chosen — sequential `viridis` for non-negative data
 (`r2`, `precision`, `auc`), diverging `RdBu_r` centred at `0` otherwise.
-当 `cmap=None` 时按数据范围自动选 cmap：非负数据用 `viridis`，否则用 `RdBu_r` 居中 0。
 
 ```python
 fig, ax = viz.plot_mosaic(mosaic, metric="r2", save_path="mosaic.png")
@@ -1142,13 +1092,12 @@ fig, ax = viz.plot_mosaic(mosaic, metric="r2", save_path="mosaic.png")
 
 ---
 
-## 9. Logging / 日志
+## 9. Logging
 
 The engine, forest and boost classes log through the standard
 `logging` module under the logger name `"ptree"`. Enable verbose tracing
 with the corresponding `verbose` constructor argument (`0` silent,
 `1` per-level / per-fit summary, `2` per-candidate (engine only)).
-引擎 / 森林 / 提升均使用 `logging`，logger 名为 `"ptree"`。`verbose` 控制详细级别。
 
 ```python
 import logging
@@ -1170,11 +1119,10 @@ Typical output:
 
 ---
 
-## 10. Version Migration / 版本迁移
+## 10. Version Migration
 
 The API additions you most often need to know about. (v0.1 defaults remain
 bit-for-bit reproducible — anything *new* is opt-in.)
-以下功能均为新增，启用前 v0.1 默认行为保持逐位可复现。
 
 | Since | API |
 |---|---|
@@ -1197,5 +1145,3 @@ bit-for-bit reproducible — anything *new* is opt-in.)
 > If a public symbol is missing from this manual, please open an issue or
 > a PR adding it. Internal helpers (functions or attributes starting with
 > `_`) are intentionally undocumented and may change without notice.
-> 若发现公共 API 缺失，欢迎提交 issue 或 PR。下划线开头的内部成员不在本手册范围内，
-> 可能随版本变动。
