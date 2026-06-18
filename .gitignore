@@ -107,7 +107,6 @@ Thumbs.db
 
 # Output files
 output/
-example/outputs/
 *.png
 *.jpg
 *.jpeg
@@ -121,3 +120,7 @@ docs/OPTIMIZATION_PLAN.md
 *.feather
 *.h5
 *.hdf5
+
+# Allow committed example outputs (re-include after global ignores above)
+!example/outputs/
+!example/outputs/**

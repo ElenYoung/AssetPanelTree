@@ -1,0 +1,34 @@
+digraph PanelTree {
+  graph [rankdir=TB, fontname="Helvetica", bgcolor="white", pad=0.3, nodesep=0.35, ranksep=0.45];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, fillcolor="white", color="#A0A8B5"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5B6B7B", arrowsize=0.7];
+  n0 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 0</B></TD></TR><TR><TD>char_1 &lt; 0.5</TD></TR><TR><TD>n=8400, gain=0.051</TD></TR><TR><TD>R²=0.033</TD></TR><TR><TD>n_oos=3600 | OOS R²=+0.036 | OOS IC=+0.166 (IR=+2.026)</TD></TR><TR><TD>ΔR²=-0.103 (L=-0.001 vs R=+0.102) | ΔIC=-0.282 (L=+0.003 vs R=+0.285)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n0 -> n1 [label="< 0.5"];
+  n1 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 1</B></TD></TR><TR><TD>char_4 &lt; 0.7</TD></TR><TR><TD>n=4144, gain=0.001</TD></TR><TR><TD>R²=0.001</TD></TR><TR><TD>n_oos=1776 | OOS R²=-0.001 | OOS IC=+0.003 (IR=+0.036)</TD></TR><TR><TD>ΔR²=+0.010 (L=-0.001 vs R=-0.011) | ΔIC=-0.059 (L=-0.022 vs R=+0.037)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n1 -> n2 [label="< 0.7"];
+  n2 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 2</B></TD></TR><TR><TD>char_2 &lt; 0.7</TD></TR><TR><TD>n=2894, gain=0.002</TD></TR><TR><TD>R²=0.000</TD></TR><TR><TD>n_oos=1228 | OOS R²=-0.001 | OOS IC=-0.022 (IR=-0.171)</TD></TR><TR><TD>ΔR²=-0.004 (L=-0.006 vs R=-0.002) | ΔIC=-0.016 (L=-0.025 vs R=-0.009)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n2 -> n3 [label="< 0.7"];
+  n3 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 3</B></TD></TR><TR><TD>n=1977</TD></TR><TR><TD>R²=0.002</TD></TR><TR><TD>n_oos=833 | OOS R²=-0.006 | OOS IC=-0.025 (IR=-0.154)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n2 -> n4 [label="≥ 0.7"];
+  n4 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 4</B></TD></TR><TR><TD>n=917</TD></TR><TR><TD>R²=0.007</TD></TR><TR><TD>n_oos=395 | OOS R²=-0.002 | OOS IC=-0.009 (IR=-0.047)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n1 -> n5 [label="≥ 0.7"];
+  n5 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 5</B></TD></TR><TR><TD>char_3 &lt; 0.5</TD></TR><TR><TD>n=1250, gain=0.007</TD></TR><TR><TD>R²=0.005</TD></TR><TR><TD>n_oos=548 | OOS R²=-0.011 | OOS IC=+0.037 (IR=+0.166)</TD></TR><TR><TD>ΔR²=-0.010 (L=-0.029 vs R=-0.019) | ΔIC=-0.139 (L=-0.131 vs R=+0.008)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n5 -> n6 [label="< 0.5"];
+  n6 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 6</B></TD></TR><TR><TD>n=598</TD></TR><TR><TD>R²=0.003</TD></TR><TR><TD>n_oos=274 | OOS R²=-0.029 | OOS IC=-0.131 (IR=-0.381)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n5 -> n7 [label="≥ 0.5"];
+  n7 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 7</B></TD></TR><TR><TD>n=652</TD></TR><TR><TD>R²=0.018</TD></TR><TR><TD>n_oos=274 | OOS R²=-0.019 | OOS IC=+0.008 (IR=+0.024)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n0 -> n8 [label="≥ 0.5"];
+  n8 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 8</B></TD></TR><TR><TD>char_2 &lt; 0.5</TD></TR><TR><TD>n=4256, gain=0.145</TD></TR><TR><TD>R²=0.103</TD></TR><TR><TD>n_oos=1824 | OOS R²=+0.102 | OOS IC=+0.285 (IR=+2.317)</TD></TR><TR><TD>ΔR²=-0.278 (L=-0.001 vs R=+0.277) | ΔIC=-0.507 (L=-0.007 vs R=+0.499)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n8 -> n9 [label="< 0.5"];
+  n9 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 9</B></TD></TR><TR><TD>char_3 &lt; 0.7</TD></TR><TR><TD>n=2128, gain=0.003</TD></TR><TR><TD>R²=0.003</TD></TR><TR><TD>n_oos=915 | OOS R²=-0.001 | OOS IC=-0.007 (IR=-0.042)</TD></TR><TR><TD>ΔR²=+0.002 (L=-0.003 vs R=-0.005) | ΔIC=-0.083 (L=-0.013 vs R=+0.069)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n9 -> n10 [label="< 0.7"];
+  n10 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 10</B></TD></TR><TR><TD>n=1481</TD></TR><TR><TD>R²=0.004</TD></TR><TR><TD>n_oos=645 | OOS R²=-0.003 | OOS IC=-0.013 (IR=-0.065)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n9 -> n11 [label="≥ 0.7"];
+  n11 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 11</B></TD></TR><TR><TD>n=647</TD></TR><TR><TD>R²=0.015</TD></TR><TR><TD>n_oos=270 | OOS R²=-0.005 | OOS IC=+0.069 (IR=+0.275)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n8 -> n12 [label="≥ 0.5"];
+  n12 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#FFF4DC"><B>Node 12</B></TD></TR><TR><TD>char_1 &lt; 0.7</TD></TR><TR><TD>n=2128, gain=0.140</TD></TR><TR><TD>R²=0.293</TD></TR><TR><TD>n_oos=909 | OOS R²=+0.277 | OOS IC=+0.499 (IR=+3.573)</TD></TR><TR><TD>ΔR²=-0.384 (L=+0.070 vs R=+0.454) | ΔIC=-0.405 (L=+0.245 vs R=+0.649)</TD></TR></TABLE>>, fillcolor="#FFF4DC"];
+  n12 -> n13 [label="< 0.7"];
+  n13 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 13</B></TD></TR><TR><TD>n=837</TD></TR><TR><TD>R²=0.095</TD></TR><TR><TD>n_oos=385 | OOS R²=+0.070 | OOS IC=+0.245 (IR=+0.811)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+  n12 -> n14 [label="≥ 0.7"];
+  n14 [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="2"><TR><TD BGCOLOR="#E8F1FB"><B>Leaf 14</B></TD></TR><TR><TD>n=1291</TD></TR><TR><TD>R²=0.450</TD></TR><TR><TD>n_oos=524 | OOS R²=+0.454 | OOS IC=+0.649 (IR=+6.007)</TD></TR></TABLE>>, fillcolor="#E8F1FB"];
+}
