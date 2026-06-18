@@ -147,6 +147,20 @@ class PanelTreeEngine:
         Set to ``-1`` to use all CPU cores.
     verbose : int, default 1
         Logging verbosity (0 = silent, 1 = per-level, 2 = per-candidate).
+    min_unique_per_split : int, default 2
+        Minimum number of distinct values a feature must have *within the
+        current node* to be considered for splitting.  Defaults to ``2``,
+        which simply rejects perfectly-constant columns (the natural lower
+        bound) while preserving the historical behaviour on all sane data.
+        Raise this to e.g. ``5`` to also reject near-constant columns that
+        only happen to flip between a handful of values in the local sample.
+        Applied symmetrically in the standard and honest split paths.
+    min_feature_variance : float, default 0.0
+        Minimum in-node variance required for a feature to be considered
+        for splitting.  ``0.0`` (default) disables the check.  A small
+        positive value (e.g. ``1e-8``) is a stronger guard than
+        ``min_unique_per_split`` against floating-point near-constants
+        that survive the unique-count test by tiny rounding noise.
     """
 
     def __init__(
@@ -172,6 +186,8 @@ class PanelTreeEngine:
         max_features: Optional[Union[str, int, float]] = None,
         splitter: str = "best",
         n_random_splits: int = 1,
+        min_unique_per_split: int = 2,
+        min_feature_variance: float = 0.0,
     ):
 
 
@@ -229,6 +245,22 @@ class PanelTreeEngine:
         if n_random_splits < 1:
             raise ValueError("n_random_splits must be >= 1.")
         self.n_random_splits = n_random_splits
+
+        # Low-quality feature guards: rejected upfront in the split search
+        # so they never enter the candidate ranking.  Defaults are deliberately
+        # permissive (only true constants are filtered) so existing callers
+        # see no behavioural drift; ``min_feature_variance > 0`` is opt-in.
+        if min_unique_per_split < 2:
+            raise ValueError(
+                "min_unique_per_split must be >= 2 (a feature with a single "
+                f"distinct value cannot define a split); got {min_unique_per_split!r}."
+            )
+        if min_feature_variance < 0:
+            raise ValueError(
+                f"min_feature_variance must be non-negative; got {min_feature_variance!r}."
+            )
+        self.min_unique_per_split = int(min_unique_per_split)
+        self.min_feature_variance = float(min_feature_variance)
 
 
 
@@ -1492,8 +1524,24 @@ class PanelTreeEngine:
         for feat_idx in range(n_features):
             col_fit = X_fit[:, feat_idx]
             col_eval = X_eval[:, feat_idx]
+            # Low-quality feature guards (mirror of the non-honest path): a
+            # column that is (near-)constant on the *node-level* sample cannot
+            # define a meaningful split.  We inspect the full node sample
+            # ``X_node[:, feat_idx]`` rather than the fit-only column so the
+            # honest fit/eval randomisation does not flicker the screen on
+            # borderline columns.
+            col_full = X_node[:, feat_idx]
+            if self.min_unique_per_split == 2:
+                if col_full.size == 0 or float(np.ptp(col_full)) == 0.0:
+                    continue
+            else:
+                if np.unique(col_full).size < self.min_unique_per_split:
+                    continue
+            if self.min_feature_variance > 0.0:
+                if col_full.size < 2 or float(col_full.var()) < self.min_feature_variance:
+                    continue
             if self.adaptive_thresholds:
-                qs = np.quantile(X_node[:, feat_idx], self.adaptive_quantiles)
+                qs = np.quantile(col_full, self.adaptive_quantiles)
                 thresholds = sorted(set(float(q) for q in qs))
             else:
                 thresholds = self.split_thresholds
@@ -1567,6 +1615,23 @@ class PanelTreeEngine:
         (``adaptive_quantiles``), de-duplicated to avoid redundant work.
         """
         col = X_node[:, feat_idx]
+        # Low-quality feature guards: reject columns that cannot meaningfully
+        # define a split inside this node.  ``min_unique_per_split`` rules out
+        # (near-)constants by distinct-value count, while
+        # ``min_feature_variance`` is a stricter variance-based check that
+        # catches floating-point near-constants surviving the unique test.
+        # We special-case ``min_unique_per_split == 2`` (the default) to a
+        # cheap ``np.ptp`` check, avoiding ``np.unique`` on every feature in
+        # the default configuration so the golden baseline path stays fast.
+        if self.min_unique_per_split == 2:
+            if col.size == 0 or float(np.ptp(col)) == 0.0:
+                return []
+        else:
+            if np.unique(col).size < self.min_unique_per_split:
+                return []
+        if self.min_feature_variance > 0.0:
+            if col.size < 2 or float(col.var()) < self.min_feature_variance:
+                return []
         if self.splitter == "random":
             # D3/Extra-Trees: draw ``n_random_splits`` random thresholds from
             # this feature's in-node value range instead of the exhaustive
